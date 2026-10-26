@@ -109,7 +109,7 @@ label.sw input { width: auto; }
     <a class="icon-btn" href="#settings" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg></a>
   </div>
   <nav class="tabs" id="tabs">
-    <a href="#live" data-t="live">Live flows</a><a href="#map" data-t="map">Flow map</a><a href="#agent" data-t="agent">Anomaly agent<span class="n hide" id="an-n"></span></a><a href="#whales" data-t="whales">BTC whales</a><a href="#perps" data-t="perps">Perps</a><a href="#macro" data-t="macro">Macro & odds</a>
+    <a href="#live" data-t="live">Live flows</a><a href="#map" data-t="map">Flow map</a><a href="#agent" data-t="agent">Anomaly agent<span class="n hide" id="an-n"></span></a><a href="#whales" data-t="whales">BTC whales</a><a href="#traders" data-t="traders">Top traders</a><a href="#agents" data-t="agents">AI agents</a><a href="#perps" data-t="perps">Perps</a><a href="#macro" data-t="macro">Macro & odds</a>
   </nav>
 </header>
 <main id="view"></main>
@@ -859,10 +859,11 @@ function stop() { streams.forEach((s) => s.close()); streams = []; running = fal
 // ------------------------------------------------------------ router
 const Screens = {};
 function route() {
-  const name = (location.hash.slice(1) || "live").split("/")[0];
+  const [name, ...rest] = (location.hash.slice(1) || "live").split("/");
   route.cur = Screens[name] ? name : "live";
-  document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.t === route.cur));
-  Screens[route.cur]($("#view"));
+  const tab = { trader: "traders", agent: "agents" }[route.cur] || route.cur;
+  document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.t === tab));
+  Screens[route.cur]($("#view"), decodeURIComponent(rest.join("/")));
 }
 window.addEventListener("hashchange", () => { route(); window.scrollTo(0, 0); });
 
@@ -1107,6 +1108,104 @@ Screens.macro = async (root) => {
   el.innerHTML = r.markets.slice(0, 40).map((m) => `<div class="mk"><div class="small muted">${esc(m.source)} · ${esc(m.event)}</div><div class="row" style="justify-content:space-between"><a href="${esc(m.url)}" target="_blank" rel="noopener" class="grow">${esc(m.question)}</a><b class="mono">${m.yes != null ? Math.round(m.yes * 100) + "%" : "—"}</b></div>
       <div class="odds"><i style="width:${(m.yes || 0) * 100}%"></i></div><div class="small muted">${m.change24 != null ? `<span class="${m.change24 > 0 ? "up" : m.change24 < 0 ? "down" : ""}">${m.change24 > 0 ? "+" : ""}${Math.round(m.change24 * 100)} pts 24h</span> · ` : ""}${X.fmtUsd(m.volume24)} traded 24h${m.ends ? ` · ends ${new Date(m.ends).toLocaleDateString()}` : ""}</div></div>`).join("") || '<p class="muted">No macro or crypto markets found.</p>';
   if (r.errors.length) el.insertAdjacentHTML("beforeend", `<details class="small" style="margin-top:8px"><summary class="muted">${r.errors.length} source problem(s)</summary>${r.errors.map((e) => `<div class="muted">${esc(e)}</div>`).join("")}</details>`);
+};
+
+// ============================================================ charts for traders and agents
+const pct = (x, d = 0) => (x == null || !isFinite(x) ? "—" : `${(x * 100).toFixed(d)}%`);
+const num2 = (x) => (x == null ? "—" : !isFinite(x) ? "∞" : x.toFixed(2));
+/** Candles with trade markers. marks: [{t, px, kind: "long"|"short"|"exit", label}], lines: [{y, color, label}] */
+function candleSvg(bars, marks = [], lines = [], H = 300) {
+  if (!bars.length) return '<p class="muted small">No price data yet.</p>';
+  const W = 900, pr = 70, pb = 20, n = bars.length, bw = (W - pr) / n;
+  const hi = Math.max(...bars.map((b) => b.h), ...lines.map((l) => l.y)), lo = Math.min(...bars.map((b) => b.l), ...lines.map((l) => l.y));
+  const y = (v) => 8 + ((hi - v) / (hi - lo || 1)) * (H - pb - 16), xi = (t) => { let k = bars.findIndex((b) => b.t > t); k = k < 0 ? n - 1 : Math.max(0, k - 1); return k * bw + bw / 2; };
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="BTC price with trades">`;
+  for (let k = 0; k <= 4; k++) { const v = lo + ((hi - lo) * k) / 4; s += `<line x1="0" x2="${W - pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${W - pr + 4}" y="${y(v) + 4}" font-size="11" fill="var(--muted)" font-family="var(--mono)">${Math.round(v).toLocaleString()}</text>`; }
+  bars.forEach((b, i) => { const c = b.c >= b.o ? "var(--up)" : "var(--down)", x = i * bw + bw / 2; s += `<line x1="${x}" x2="${x}" y1="${y(b.h)}" y2="${y(b.l)}" stroke="${c}" stroke-width="${Math.max(0.6, bw * 0.15)}"/><rect x="${x - Math.max(0.5, bw * 0.35)}" width="${Math.max(1, bw * 0.7)}" y="${Math.min(y(b.o), y(b.c))}" height="${Math.max(0.8, Math.abs(y(b.o) - y(b.c)))}" fill="${c}"/>`; });
+  for (const l of lines) s += `<line x1="0" x2="${W - pr}" y1="${y(l.y)}" y2="${y(l.y)}" stroke="${l.color}" stroke-dasharray="5 4"/><text x="4" y="${y(l.y) - 3}" font-size="11" fill="${l.color}">${esc(l.label)} ${Math.round(l.y).toLocaleString()}</text>`;
+  for (const m of marks) { const x = xi(m.t), yy = y(m.px); s += m.kind === "exit" ? `<circle cx="${x}" cy="${yy}" r="5" fill="none" stroke="var(--gold)" stroke-width="2"><title>${esc(m.label || "")}</title></circle>` : `<path d="M${x - 6} ${m.kind === "long" ? yy + 9 : yy - 9} L${x + 6} ${m.kind === "long" ? yy + 9 : yy - 9} L${x} ${yy}Z" fill="${m.kind === "long" ? "var(--up)" : "var(--down)"}"><title>${esc(m.label || "")}</title></path>`; }
+  [0, Math.floor(n / 2), n - 1].forEach((i) => (s += `<text x="${i * bw}" y="${H - 4}" font-size="11" fill="var(--muted)" text-anchor="${i ? (i === n - 1 ? "end" : "middle") : "start"}">${new Date(bars[i].t * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit" })}</text>`));
+  return s + "</svg>";
+}
+/** Equity curves: series [{name, color, pts: [[t, v]]}] */
+function curveSvg(series, H = 220, money = true) {
+  const all = series.flatMap((x) => x.pts);
+  if (all.length < 2) return '<p class="muted small">Not enough history yet.</p>';
+  const W = 900, pr = 70, t0 = Math.min(...all.map((p) => p[0])), t1 = Math.max(...all.map((p) => p[0])), v0 = Math.min(...all.map((p) => p[1])), v1 = Math.max(...all.map((p) => p[1]));
+  const x = (t) => ((t - t0) / (t1 - t0 || 1)) * (W - pr), y = (v) => 8 + ((v1 - v) / (v1 - v0 || 1)) * (H - 28);
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="equity curves">`;
+  for (let k = 0; k <= 3; k++) { const v = v0 + ((v1 - v0) * k) / 3; s += `<line x1="0" x2="${W - pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${W - pr + 4}" y="${y(v) + 4}" font-size="11" fill="var(--muted)" font-family="var(--mono)">${money ? X.fmtUsd(v) : v.toFixed(0)}</text>`; }
+  for (const sr of series) if (sr.pts.length > 1) s += `<path d="${sr.pts.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("")}" fill="none" stroke="${sr.color}" stroke-width="2"><title>${esc(sr.name)}</title></path>`;
+  return s + "</svg>";
+}
+const PALETTE = ["var(--brand)", "var(--blue)", "var(--gold)", "var(--violet)", "var(--orange)", "var(--down)", "var(--muted)"];
+const needServer = (root, what) => { root.innerHTML = `<div class="card"><h3>${what}</h3><p class="small">This runs on your 24/7 server: it reads traders' histories every hour and runs the agents around the clock. Open the app from your server address (https://YOUR-IP.sslip.io) to use it.</p></div>`; };
+
+// ============================================================ Top traders (human)
+Screens.traders = async (root) => {
+  if (!SERVER) return needServer(root, "Top traders");
+  root.innerHTML = '<div class="card"><p class="muted">Loading…</p></div>';
+  const [tr, fo] = await Promise.all([api("/api/traders"), api("/api/follows").catch(() => ({ follows: [], feed: [] }))]);
+  const followed = new Set(fo.follows.map((f) => f.address.toLowerCase()));
+  root.innerHTML = `<div class="card"><h3>Copy-trade feed <span class="r small muted">${fo.follows.length} followed · BTC trades also go to Telegram</span></h3>
+      ${fo.feed.slice(0, 12).map((f) => `<div class="ev"><div class="side b-${/Long/.test(f.dir) && /Open|Short > Long/.test(f.dir) ? "bullish" : /Short/.test(f.dir) && /Open|Long > Short/.test(f.dir) ? "bearish" : "neutral"}"></div><div><div class="small">${esc(f.text)}</div><div class="small muted">${ago(f.time)}</div></div></div>`).join("") || '<p class="muted small">Follow a trader below to get their trades here and on Telegram as they happen.</p>'}</div>
+    <div class="card"><h3>Best Hyperliquid traders to copy <span class="r small muted">${tr.at ? "ranked " + ago(tr.at) : "first ranking ~1h after start"}</span></h3>
+      <p class="small muted" style="margin-top:0">From each trader's real closed trades over 30 days. Score mixes win rate, payoff (average win ÷ average loss), profit factor and drawdown; at least 20 trades needed. Past results don't promise future ones.</p>
+      ${(tr.rows || []).map((t, i) => { const s = t.stats, on = followed.has(t.address.toLowerCase()); return `<div class="mk"><div class="row" style="justify-content:space-between"><a href="#trader/${esc(t.address)}"><b>${i + 1}. ${esc(t.name || X.short(t.address))}</b></a><span class="chip ${t.score >= 60 ? "ok" : t.score >= 40 ? "wait" : ""}">score ${t.score}</span></div>
+        <div class="stats" style="margin-top:6px"><div class="stat"><div class="v">${pct(s.winRate)}</div><div class="k">win rate</div></div><div class="stat"><div class="v">${num2(s.payoff)}</div><div class="k">RR (payoff)</div></div><div class="stat"><div class="v">${num2(s.profitFactor)}</div><div class="k">profit factor</div></div><div class="stat"><div class="v up">${X.fmtUsd(s.pnl)}</div><div class="k">30d closed PnL</div></div></div>
+        <div class="row small muted" style="justify-content:space-between;margin-top:4px"><span>${s.trades} trades · max drawdown ${X.fmtUsd(s.maxDrawdown)} · BTC ${pct(s.btcShare)} · account ${X.fmtUsd(t.accountValue)}</span><span><a href="#trader/${esc(t.address)}" class="btn small">Chart</a> <button class="btn small ${on ? "" : "primary"}" data-follow="${esc(t.address)}" data-name="${esc(t.name || "")}" data-on="${on ? 0 : 1}">${on ? "Following ✓" : "Follow"}</button></span></div></div>`; }).join("") || '<p class="muted">The server ranks traders an hour after it starts and every hour after that.</p>'}</div>`;
+  root.querySelectorAll("[data-follow]").forEach((b) => (b.onclick = async () => { b.disabled = true; await api("/api/follow", { method: "POST", body: JSON.stringify({ address: b.dataset.follow, name: b.dataset.name, on: b.dataset.on === "1" }) }); toast(b.dataset.on === "1" ? "Following: their BTC trades will alert you" : "Unfollowed"); Screens.traders(root); }));
+};
+Screens.trader = async (root, address) => {
+  if (!SERVER) return needServer(root, "Trader");
+  root.innerHTML = '<div class="card"><p class="muted">Reading this trader\'s last 30 days…</p></div>';
+  try {
+    const d = await api(`/api/trader?address=${encodeURIComponent(address)}`), s = d.stats;
+    const marks = d.btcFills.filter((f) => d.candles.length && f.t >= d.candles[0].t).map((f) => ({ t: f.t, px: f.px, kind: /^Open Long|Short > Long/.test(f.dir) ? "long" : /^Open Short|Long > Short/.test(f.dir) ? "short" : "exit", label: `${f.dir} ${f.sz} BTC @ ${f.px}${f.pnl ? " · PnL " + Math.round(f.pnl) : ""}` }));
+    root.innerHTML = `<div class="card"><div class="row" style="justify-content:space-between"><div><b>${esc(X.short(address))}</b><div class="mono small muted">${esc(address)}</div></div><button class="btn ${d.following ? "" : "primary"}" id="tf">${d.following ? "Following ✓" : "Follow & alert me"}</button></div>
+        <div class="stats" style="margin-top:8px"><div class="stat"><div class="v">${d.score}</div><div class="k">copy score</div></div><div class="stat"><div class="v">${pct(s.winRate)}</div><div class="k">win rate (${s.wins}/${s.trades})</div></div><div class="stat"><div class="v">${num2(s.payoff)}</div><div class="k">RR (payoff)</div></div><div class="stat"><div class="v">${num2(s.profitFactor)}</div><div class="k">profit factor</div></div><div class="stat"><div class="v ${s.pnl >= 0 ? "up" : "down"}">${X.fmtUsd(s.pnl)}</div><div class="k">closed PnL 30d</div></div><div class="stat"><div class="v down">${X.fmtUsd(s.maxDrawdown)}</div><div class="k">max drawdown</div></div></div></div>
+      <div class="card"><h3>Their BTC trades on the chart <span class="r small muted">1h candles · ▲ long ▼ short ○ exit</span></h3>${candleSvg(d.candles, marks)}</div>
+      <div class="card"><h3>Profit curve (closed trades, all coins)</h3>${curveSvg([{ name: "PnL", color: "var(--brand)", pts: s.equity }])}</div>
+      <div class="card"><h3>Recent closed trades</h3><div class="scroll"><table><thead><tr><th>When</th><th>Coin</th><th>Side</th><th>Size</th><th>Net PnL</th></tr></thead><tbody>${s.recent.map((r) => `<tr><td>${ago(Math.floor(r.time / 1000))}</td><td>${esc(r.coin)}</td><td>${r.side}</td><td>${X.fmtNum(r.sz, 3)}</td><td class="${r.net >= 0 ? "up" : "down"}">${X.fmtUsd(r.net)}</td></tr>`).join("")}</tbody></table></div>
+        <p class="small muted">Open their full history on <a href="https://app.hyperliquid.xyz/explorer/address/${esc(address)}" target="_blank" rel="noopener">Hyperliquid</a>.</p></div>`;
+    $("#tf").onclick = async () => { await api("/api/follow", { method: "POST", body: JSON.stringify({ address, on: !d.following }) }); toast(d.following ? "Unfollowed" : "Following: their BTC trades will alert you"); Screens.trader(root, address); };
+  } catch (e) { root.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+};
+
+// ============================================================ AI agents (paper trading BTC)
+Screens.agents = async (root) => {
+  if (!SERVER) return needServer(root, "AI agent traders");
+  root.innerHTML = '<div class="card"><p class="muted">Loading…</p></div>';
+  const d = await api("/api/agents");
+  if (!d.board || !d.board.length) { root.innerHTML = '<div class="card"><p class="muted">The agents are warming up: their 2-week backtest runs a minute after the server starts.</p></div>'; return; }
+  root.innerHTML = `<div class="card"><h3>AI agent leaderboard <span class="r small muted">BTC · $10,000 paper each · 1% risk a trade</span></h3>
+      <p class="small muted" style="margin-top:0">Each agent follows the Day Trader method: a setup, a 5-minute trigger, a stop and target set before entry, 1% risk sizing, max 4 trades and 3R loss a day, flat by 23:55 UTC, Hyperliquid fees included. Results since ${new Date(d.from * 1000).toLocaleDateString()} (first 2 weeks are a backtest).</p>
+      ${curveSvg(d.board.map((a, i) => ({ name: a.name, color: PALETTE[i % PALETTE.length], pts: a.curve })))}
+      <div class="row small" style="gap:10px;margin-top:4px">${d.board.map((a, i) => `<span><i style="display:inline-block;width:10px;height:3px;background:${PALETTE[i % PALETTE.length]};vertical-align:middle"></i> ${esc(a.name)}</span>`).join("")}</div></div>
+    ${d.board.map((a, i) => { const s = a.stats; return `<div class="card"><div class="row" style="justify-content:space-between"><a href="#agent/${esc(a.id)}"><b>${i + 1}. ${esc(a.name)}</b>${a.llm ? ' <span class="chip">Claude</span>' : ""}</a><span class="chip ${i === 0 ? "ok" : ""}">score ${a.score}</span></div>
+      <div class="stats" style="margin-top:6px"><div class="stat"><div class="v ${s.returnPct >= 0 ? "up" : "down"}">${s.returnPct >= 0 ? "+" : ""}${s.returnPct.toFixed(1)}%</div><div class="k">return</div></div><div class="stat"><div class="v">${pct(s.winRate)}</div><div class="k">win rate</div></div><div class="stat"><div class="v">${num2(s.payoff)}</div><div class="k">RR (payoff)</div></div><div class="stat"><div class="v">${num2(s.profitFactor)}</div><div class="k">profit factor</div></div><div class="stat"><div class="v">${s.trades}</div><div class="k">trades (${a.live.trades} live)</div></div><div class="stat"><div class="v down">${s.maxDDPct.toFixed(1)}%</div><div class="k">max drawdown</div></div></div>
+      ${a.open ? `<div class="note-box" style="margin-top:8px"><b class="${a.open.side === "long" ? "up" : "down"}">OPEN ${a.open.side.toUpperCase()}</b> @ ${X.fmtNum(a.open.entry, 0)} · stop ${X.fmtNum(a.open.stop, 0)} · target ${X.fmtNum(a.open.target, 0)} · ${esc(a.open.why)}</div>` : ""}
+      <p class="small muted" style="margin:6px 0 0">${esc(a.style)}</p></div>`; }).join("")}
+    ${d.lastClaude ? `<div class="card"><h3>Claude's last decision</h3><p class="small">${esc(d.lastClaude.error || (d.lastClaude.decision && (d.lastClaude.decision.wait ? "Wait: " + d.lastClaude.decision.why : `${d.lastClaude.decision.side} · ${d.lastClaude.decision.why}`)) || "—")}</p><p class="small muted">${ago(d.lastClaude.at)}</p></div>` : `<div class="note-box">Add ANTHROPIC_API_KEY on the server to add the Claude Strategist agent (one decision an hour, billed to your Anthropic account).</div>`}
+    <div class="card"><h3>Telegram alerts for agent trades</h3><div class="row">${["top", "all", "off"].map((m) => `<button class="btn small ${d.alerts === m ? "primary" : ""}" data-al="${m}">${{ top: "Top agent only", all: "Every agent", off: "Off" }[m]}</button>`).join("")}</div><p class="small muted">Paper trades only. Nothing here can place a real order.</p></div>`;
+  root.querySelectorAll("[data-al]").forEach((b) => (b.onclick = async () => { await api("/api/agentalerts", { method: "POST", body: JSON.stringify({ mode: b.dataset.al }) }); Screens.agents(root); }));
+};
+Screens.agent = async (root, id) => {
+  if (!SERVER) return needServer(root, "Agent");
+  root.innerHTML = '<div class="card"><p class="muted">Loading…</p></div>';
+  try {
+    const [d, all] = await Promise.all([api(`/api/agent?id=${encodeURIComponent(id)}`), api("/api/agents")]);
+    const meta = all.board.find((a) => a.id === id) || { name: id, stats: {} };
+    const t0 = d.bars.length ? d.bars[0].t : 0;
+    const marks = [];
+    for (const tr of d.trades.filter((x) => x.closed >= t0)) { marks.push({ t: tr.opened - 300, px: tr.entry, kind: tr.side, label: `${tr.side} @ ${Math.round(tr.entry)} · ${tr.why}` }); marks.push({ t: tr.closed - 300, px: tr.exit, kind: "exit", label: `${tr.exitWhy} @ ${Math.round(tr.exit)} · ${tr.R}R` }); }
+    if (d.open) marks.push({ t: d.open.opened - 300, px: d.open.entry, kind: d.open.side, label: d.open.why });
+    const lines = d.open ? [{ y: d.open.stop, color: "var(--down)", label: "stop" }, { y: d.open.target, color: "var(--up)", label: "target" }, { y: d.open.entry, color: "var(--text)", label: "entry" }] : [];
+    root.innerHTML = `<div class="card"><b>${esc(meta.name)}</b><p class="small muted" style="margin:4px 0 0">${esc(meta.style || "")}</p></div>
+      <div class="card"><h3>Last 48 hours <span class="r small muted">5m · ▲ long ▼ short ○ exit</span></h3>${candleSvg(d.bars, marks, lines)}</div>
+      <div class="card"><h3>Equity</h3>${curveSvg([{ name: meta.name, color: "var(--brand)", pts: d.curve }])}</div>
+      <div class="card"><h3>Trades</h3><div class="scroll"><table><thead><tr><th>Opened</th><th>Side</th><th>Entry</th><th>Exit</th><th>Why out</th><th>R</th><th>Net</th></tr></thead><tbody>${d.trades.slice().reverse().slice(0, 60).map((r) => `<tr title="${esc(r.why)}"><td>${new Date(r.opened * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}${r.live ? "" : " <span class=muted>bt</span>"}</td><td class="${r.side === "long" ? "up" : "down"}">${r.side}</td><td>${X.fmtNum(r.entry, 0)}</td><td>${X.fmtNum(r.exit, 0)}</td><td>${esc(r.exitWhy)}</td><td class="${r.R >= 0 ? "up" : "down"}">${r.R}</td><td class="${r.net >= 0 ? "up" : "down"}">${X.fmtUsd(r.net)}</td></tr>`).join("")}</tbody></table></div><p class="small muted">bt = backtest (before the agent went live).</p></div>`;
+  } catch (e) { root.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 };
 
 // ============================================================ Settings

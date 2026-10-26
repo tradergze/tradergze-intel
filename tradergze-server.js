@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Single-file build of server/server.js with src/intel.js inlined (made by build.js). Upload next to tradergze-intel.html and install.sh.
+// Single-file build of server/server.js (made by build.js). Upload next to tradergze-intel.html and install.sh.
 // TraderGze Intel server: tracks BTC, USDT and USDC around the clock, keeps the record in SQLite,
 // runs the anomaly agent, serves the app and its API, and alerts on Telegram.
 // Node 22+, no packages. Configuration: environment variables (see config.example.env).
@@ -634,6 +634,349 @@ const X = (function () { const module = { exports: {} };
 })(typeof window !== "undefined" ? window : globalThis);
 
 return module.exports; })();
+const AG = (function () { const module = { exports: {} };
+// TraderGze Intel: (1) top human traders on Hyperliquid, ranked by win rate and payoff, with live
+// copy-trade alerts; (2) AI agent day traders on BTC, trading paper money with the day-trader method:
+// setup -> trigger -> stop and target before entry -> 1% risk sizing -> daily limits.
+// Pure logic plus thin Hyperliquid readers; runs in Node 18+ (the server) and the browser.
+(function (root) {
+  "use strict";
+  const A = {};
+  const HL = "https://api.hyperliquid.xyz/info";
+  const post = async (body) => {
+    const r = await A.fetch(HL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(`Hyperliquid answered HTTP ${r.status}`);
+    return r.json();
+  };
+  A.fetch = (...a) => fetch(...a);
+  const round = (x, d = 2) => (x == null || !isFinite(x) ? null : Math.round(x * 10 ** d) / 10 ** d);
+
+  // ================================================================ 1. top human traders
+
+  /** A trader's fills -> closed-trade statistics (Hyperliquid reports closedPnl on closing fills). */
+  function traderStats(fills, coin = null) {
+    const fs = (fills || []).filter((f) => !coin || f.coin === coin).slice().sort((a, b) => a.time - b.time);
+    // group closing fills of the same order into one trade
+    const closes = new Map();
+    for (const f of fs) {
+      const pnl = Number(f.closedPnl || 0), fee = Number(f.fee || 0);
+      if (!/^Close|Long > Short|Short > Long/.test(f.dir || "") || pnl === 0) continue;
+      const k = f.oid || f.hash || f.tid;
+      const c = closes.get(k) || { time: f.time, coin: f.coin, pnl: 0, fee: 0, side: /Long/.test(f.dir) && /^Close Long|Long > Short/.test(f.dir) ? "long" : "short", px: Number(f.px), sz: 0 };
+      c.pnl += pnl; c.fee += fee; c.sz += Number(f.sz); c.time = Math.max(c.time, f.time);
+      closes.set(k, c);
+    }
+    const trades = [...closes.values()].sort((a, b) => a.time - b.time).map((c) => Object.assign(c, { net: c.pnl - c.fee }));
+    const wins = trades.filter((t) => t.net > 0), losses = trades.filter((t) => t.net <= 0);
+    const sumW = wins.reduce((s, t) => s + t.net, 0), sumL = -losses.reduce((s, t) => s + t.net, 0);
+    let cum = 0, peak = 0, maxDD = 0;
+    const equity = trades.map((t) => { cum += t.net; peak = Math.max(peak, cum); maxDD = Math.max(maxDD, peak - cum); return [Math.floor(t.time / 1000), round(cum)]; });
+    const btc = fs.filter((f) => f.coin === "BTC").length;
+    return {
+      trades: trades.length, wins: wins.length, losses: losses.length,
+      winRate: trades.length ? wins.length / trades.length : null,
+      avgWin: wins.length ? sumW / wins.length : null, avgLoss: losses.length ? sumL / losses.length : null,
+      payoff: wins.length && losses.length && sumL > 0 ? (sumW / wins.length) / (sumL / losses.length) : null,
+      profitFactor: sumL > 0 ? sumW / sumL : wins.length ? Infinity : null,
+      pnl: cum, maxDrawdown: maxDD, btcShare: fs.length ? btc / fs.length : 0,
+      first: fs.length ? Math.floor(fs[0].time / 1000) : null, last: fs.length ? Math.floor(fs[fs.length - 1].time / 1000) : null,
+      equity, recent: trades.slice(-30).reverse(),
+    };
+  }
+  A.traderStats = traderStats;
+
+  /**
+   * One number for "worth copying": rewards win rate, payoff and profit factor, needs enough trades,
+   * punishes a drawdown that is large next to the profit. 0-100.
+   */
+  function copyScore(s, minTrades = 20) {
+    if (!s || s.trades < minTrades || s.pnl <= 0) return 0;
+    const wr = s.winRate || 0, po = Math.min(s.payoff || 0, 4) / 4, pf = Math.min(isFinite(s.profitFactor) ? s.profitFactor : 4, 4) / 4;
+    const depth = Math.min(1, Math.log10(s.trades) / 2);                  // 100 trades = full weight
+    const dd = s.pnl > 0 ? Math.min(1, s.maxDrawdown / s.pnl) : 1;
+    return Math.round(100 * (0.35 * wr + 0.3 * po + 0.35 * pf) * (0.6 + 0.4 * depth) * (1 - 0.5 * dd));
+  }
+  A.copyScore = copyScore;
+
+  async function fills(user, days = 30) {
+    return post({ type: "userFillsByTime", user, startTime: Date.now() - days * 86400e3, aggregateByTime: true });
+  }
+  A.fills = fills;
+
+  /** Rank leaderboard traders by their real closed trades. candidates: [{address, name, accountValue, pnl}] */
+  async function rankTraders(candidates, { days = 30, coin = null, minTrades = 20, onProgress } = {}) {
+    const out = [];
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      try {
+        const f = await fills(c.address, days);
+        const s = traderStats(f, coin);
+        out.push(Object.assign({}, c, { stats: Object.assign({}, s, { equity: undefined, recent: undefined }), score: copyScore(s, minTrades) }));
+      } catch (e) { out.push(Object.assign({}, c, { error: e.message, score: 0 })); }
+      if (onProgress) onProgress(i + 1, candidates.length);
+    }
+    return out.filter((t) => t.score > 0).sort((a, b) => b.score - a.score);
+  }
+  A.rankTraders = rankTraders;
+
+  /** A fill as a copy-trade alert line. */
+  function fillAlert(name, f) {
+    const usd = Number(f.px) * Number(f.sz);
+    const verb = { "Open Long": "opened / added LONG", "Open Short": "opened / added SHORT", "Close Long": "closed LONG", "Close Short": "closed SHORT", "Long > Short": "flipped to SHORT", "Short > Long": "flipped to LONG" }[f.dir] || f.dir;
+    const pnl = Number(f.closedPnl || 0);
+    return `${name} ${verb} ${Number(f.sz)} ${f.coin} @ ${Number(f.px).toLocaleString("en-US")} (≈$${Math.round(usd).toLocaleString("en-US")})${pnl ? ` · realized ${pnl > 0 ? "+" : ""}$${Math.round(pnl).toLocaleString("en-US")}` : ""}`;
+  }
+  A.fillAlert = fillAlert;
+
+  // ================================================================ candles and indicators
+
+  /** Hyperliquid candles -> [{t (s), o, h, l, c, v}] oldest first. */
+  async function candles(coin = "BTC", interval = "5m", hours = 24 * 14) {
+    const end = Date.now(), start = end - hours * 3600e3;
+    const r = await post({ type: "candleSnapshot", req: { coin, interval, startTime: start, endTime: end } });
+    return (r || []).map((k) => ({ t: Math.floor(k.t / 1000), o: +k.o, h: +k.h, l: +k.l, c: +k.c, v: +k.v }));
+  }
+  A.candles = candles;
+
+  const ema = (vals, n) => { const k = 2 / (n + 1); let e = null; return vals.map((v) => (e = e == null ? v : v * k + e * (1 - k))); };
+  function rsi(closes, n = 14) {
+    const out = new Array(closes.length).fill(null);
+    let ag = 0, al = 0;
+    for (let i = 1; i < closes.length; i++) {
+      const g = Math.max(0, closes[i] - closes[i - 1]), l = Math.max(0, closes[i - 1] - closes[i]);
+      if (i <= n) { ag += g / n; al += l / n; if (i === n) out[i] = al ? 100 - 100 / (1 + ag / al) : 100; continue; }
+      ag = (ag * (n - 1) + g) / n; al = (al * (n - 1) + l) / n;
+      out[i] = al ? 100 - 100 / (1 + ag / al) : 100;
+    }
+    return out;
+  }
+  function atr(bars, n = 14) {
+    const out = []; let a = null;
+    bars.forEach((b, i) => { const tr = i ? Math.max(b.h - b.l, Math.abs(b.h - bars[i - 1].c), Math.abs(b.l - bars[i - 1].c)) : b.h - b.l; a = a == null ? tr : (a * (n - 1) + tr) / n; out.push(a); });
+    return out;
+  }
+  function indicators(bars) {
+    const c = bars.map((b) => b.c);
+    const sma20 = c.map((_, i) => (i >= 19 ? c.slice(i - 19, i + 1).reduce((s, x) => s + x, 0) / 20 : null));
+    const sd20 = c.map((_, i) => (i >= 19 ? Math.sqrt(c.slice(i - 19, i + 1).reduce((s, x) => s + (x - sma20[i]) ** 2, 0) / 20) : null));
+    return { ema20: ema(c, 20), ema50: ema(c, 50), ema200: ema(c, 200), rsi: rsi(c), atr: atr(bars), sma20, upper: sma20.map((m, i) => (m == null ? null : m + 2 * sd20[i])), lower: sma20.map((m, i) => (m == null ? null : m - 2 * sd20[i])) };
+  }
+  A.indicators = indicators;
+
+  // ================================================================ 2. the AI agents (strategies)
+
+  const dayOf = (t) => Math.floor(t / 86400);
+  const minuteOfDay = (t) => Math.floor((t % 86400) / 60);
+  // Each decide() sees closed bars up to i and returns null or {side, stop, target, why}. Entry is bar i's close.
+  const AGENTS = [
+    { id: "orb", name: "ORB Sniper", style: "Opening-range breakout (the Day Trader method): the first hour of the UTC day sets the range; the first 5-minute close outside it triggers. Stop at the range midpoint, target 2R.",
+      decide({ bars, i }) {
+        const b = bars[i], m = minuteOfDay(b.t + 300);
+        if (m <= 60 || m > 16 * 60) return null;                       // after the range, before 16:00 UTC
+        const day = dayOf(b.t), range = [];
+        for (let j = i; j >= 0 && dayOf(bars[j].t) === day; j--) if (minuteOfDay(bars[j].t) < 60) range.push(bars[j]);
+        if (range.length < 12) return null;
+        const hi = Math.max(...range.map((x) => x.h)), lo = Math.min(...range.map((x) => x.l)), mid = (hi + lo) / 2;
+        const prev = bars[i - 1];
+        if (b.c > hi && prev.c <= hi) return { side: "long", stop: mid, target: b.c + 2 * (b.c - mid), why: `5m close ${b.c.toFixed(0)} broke the opening range high ${hi.toFixed(0)}` };
+        if (b.c < lo && prev.c >= lo) return { side: "short", stop: mid, target: b.c - 2 * (mid - b.c), why: `5m close ${b.c.toFixed(0)} broke the opening range low ${lo.toFixed(0)}` };
+        return null;
+      } },
+    { id: "breakout", name: "Breakout Hunter", style: "Buys a close above the 4-hour high (sells below the 4-hour low). Stop 1.5×ATR, target 3×ATR.",
+      decide({ bars, i, ind }) {
+        if (i < 49) return null;
+        const w = bars.slice(i - 48, i), hi = Math.max(...w.map((x) => x.h)), lo = Math.min(...w.map((x) => x.l)), b = bars[i], a = ind.atr[i];
+        if (b.c > hi) return { side: "long", stop: b.c - 1.5 * a, target: b.c + 3 * a, why: `close above the 4h high ${hi.toFixed(0)}` };
+        if (b.c < lo) return { side: "short", stop: b.c + 1.5 * a, target: b.c - 3 * a, why: `close below the 4h low ${lo.toFixed(0)}` };
+        return null;
+      } },
+    { id: "meanrev", name: "Mean Reverter", style: "Fades stretched moves: RSI under 25 and a close below the lower Bollinger band (or the mirror). Stop 1.2×ATR, target the 20-bar average.",
+      decide({ bars, i, ind }) {
+        const b = bars[i], r = ind.rsi[i], a = ind.atr[i];
+        if (r == null || ind.lower[i] == null) return null;
+        if (r < 25 && b.c < ind.lower[i] && ind.sma20[i] - b.c > a) return { side: "long", stop: b.c - 1.2 * a, target: ind.sma20[i], why: `RSI ${r.toFixed(0)} under the lower band` };
+        if (r > 75 && b.c > ind.upper[i] && b.c - ind.sma20[i] > a) return { side: "short", stop: b.c + 1.2 * a, target: ind.sma20[i], why: `RSI ${r.toFixed(0)} over the upper band` };
+        return null;
+      } },
+    { id: "trend", name: "Trend Rider", style: "Joins the trend when the 20 EMA crosses the 50 EMA on the side of the 200 EMA. Stop 2×ATR, target 4×ATR.",
+      decide({ bars, i, ind }) {
+        if (i < 200) return null;
+        const b = bars[i], up = ind.ema20[i] > ind.ema50[i] && ind.ema20[i - 1] <= ind.ema50[i - 1], dn = ind.ema20[i] < ind.ema50[i] && ind.ema20[i - 1] >= ind.ema50[i - 1], a = ind.atr[i];
+        if (up && b.c > ind.ema200[i]) return { side: "long", stop: b.c - 2 * a, target: b.c + 4 * a, why: "20 EMA crossed above the 50 EMA, price above the 200 EMA" };
+        if (dn && b.c < ind.ema200[i]) return { side: "short", stop: b.c + 2 * a, target: b.c - 4 * a, why: "20 EMA crossed below the 50 EMA, price below the 200 EMA" };
+        return null;
+      } },
+    { id: "funding", name: "Funding Fader", style: "Trades against crowded perps: shorts a 1-hour high when funding is very positive, buys a 1-hour low when it is negative. Stop 1.5×ATR, target 2.5×ATR.",
+      decide({ bars, i, ind, ctx }) {
+        const f = ctx && ctx.funding;
+        if (f == null || i < 13) return null;
+        const w = bars.slice(i - 12, i), b = bars[i], a = ind.atr[i];
+        if (f > 0.0001 && b.h >= Math.max(...w.map((x) => x.h))) return { side: "short", stop: b.c + 1.5 * a, target: b.c - 2.5 * a, why: `funding +${(f * 100).toFixed(4)}%/h at a 1h high` };
+        if (f < -0.00005 && b.l <= Math.min(...w.map((x) => x.l))) return { side: "long", stop: b.c - 1.5 * a, target: b.c + 2.5 * a, why: `funding ${(f * 100).toFixed(4)}%/h at a 1h low` };
+        return null;
+      } },
+    { id: "whale", name: "Whale Follower", style: "Trades the anomaly agent: big BTC deposits to exchanges → short; stablecoin mints and deposits → long. Stop 1.5×ATR, target 3×ATR.",
+      decide({ bars, i, ind, ctx }) {
+        const list = (ctx && ctx.anomalies) || [], b = bars[i], a = ind.atr[i];
+        const recent = list.filter((x) => x.time > b.t - 3600 && x.time <= b.t + 300 && (x.severity === "critical" || x.severity === "high"));
+        let bull = 0, bear = 0;
+        for (const x of recent) { if (x.bias === "bullish") bull += x.score; if (x.bias === "bearish") bear += x.score; }
+        if (bull >= 140 && bull > bear * 2) return { side: "long", stop: b.c - 1.5 * a, target: b.c + 3 * a, why: `${recent.length} bullish whale signals in the last hour` };
+        if (bear >= 140 && bear > bull * 2) return { side: "short", stop: b.c + 1.5 * a, target: b.c - 3 * a, why: `${recent.length} bearish whale signals in the last hour` };
+        return null;
+      } },
+  ];
+  const LLM_AGENT = { id: "claude", name: "Claude Strategist", style: "Claude Opus 5.5 reads the last 2 days of 5-minute bars, indicators, funding and whale anomalies every hour and decides: long, short or wait, with its own stop and target. Same risk rules as the others.", llm: true };
+  A.AGENTS = AGENTS; A.LLM_AGENT = LLM_AGENT;
+
+  // ================================================================ the paper broker and the day-trader risk rules
+
+  const RULES = { equity: 10000, riskPct: 1, feePct: 0.045, maxTradesPerDay: 4, maxDailyLossR: 3, minRR: 1.2, maxHoldBars: 288, flatByMinute: 23 * 60 + 55 };
+  A.RULES = RULES;
+  const newBook = (id) => ({ id, equity: RULES.equity, peak: RULES.equity, maxDD: 0, open: null, trades: [], curve: [], lastT: 0, day: null, dayTrades: 0, dayR: 0 });
+  A.newBook = newBook;
+
+  function closePos(book, t, px, why) {
+    const p = book.open, dir = p.side === "long" ? 1 : -1;
+    const gross = dir * (px - p.entry) * p.size, fees = (p.entry + px) * p.size * RULES.feePct / 100;
+    const net = gross - fees, R = net / p.riskUsd;
+    book.equity += net; book.peak = Math.max(book.peak, book.equity); book.maxDD = Math.max(book.maxDD, (book.peak - book.equity) / book.peak);
+    book.dayR += R;
+    book.trades.push({ side: p.side, entry: p.entry, exit: px, stop: p.stop, target: p.target, size: p.size, opened: p.opened, closed: t, net: round(net), R: round(R), why: p.why, exitWhy: why, live: p.live });
+    if (book.trades.length > 500) book.trades.shift();
+    book.open = null;
+  }
+
+  /**
+   * Walk one agent over new closed bars. decideFn(bars, i, ind) -> plan or null. Returns the
+   * trades opened and closed in this step (for alerts). `live` marks trades taken after the backtest.
+   */
+  function step(book, bars, ind, decideFn, { live = false } = {}) {
+    const events = [];
+    for (let i = 1; i < bars.length; i++) {
+      const b = bars[i];
+      if (b.t <= book.lastT) continue;
+      const d = dayOf(b.t);
+      if (d !== book.day) { book.day = d; book.dayTrades = 0; book.dayR = 0; }
+      // manage the open position on this bar: stop first when both are inside one bar (conservative)
+      if (book.open) {
+        const p = book.open, held = (b.t - p.opened) / 300;
+        if (p.side === "long" ? b.l <= p.stop : b.h >= p.stop) { closePos(book, b.t + 300, p.stop, "stop"); events.push({ kind: "close", trade: book.trades[book.trades.length - 1] }); }
+        else if (p.side === "long" ? b.h >= p.target : b.l <= p.target) { closePos(book, b.t + 300, p.target, "target"); events.push({ kind: "close", trade: book.trades[book.trades.length - 1] }); }
+        else if (held >= RULES.maxHoldBars || minuteOfDay(b.t + 300) >= RULES.flatByMinute) { closePos(book, b.t + 300, b.c, held >= RULES.maxHoldBars ? "time" : "flat by day end"); events.push({ kind: "close", trade: book.trades[book.trades.length - 1] }); }
+      }
+      // look for a new entry at this bar's close
+      if (!book.open && book.dayTrades < RULES.maxTradesPerDay && book.dayR > -RULES.maxDailyLossR && minuteOfDay(b.t + 300) < RULES.flatByMinute - 30) {
+        const plan = decideFn(bars, i, ind);
+        if (plan && plan.stop && plan.target) {
+          const entry = b.c, risk = Math.abs(entry - plan.stop), rr = Math.abs(plan.target - entry) / risk;
+          const valid = plan.side === "long" ? plan.stop < entry && plan.target > entry : plan.stop > entry && plan.target < entry;
+          if (valid && risk / entry > 0.0008 && rr >= RULES.minRR) {
+            const riskUsd = book.equity * RULES.riskPct / 100, size = riskUsd / risk;
+            book.open = { side: plan.side, entry, stop: plan.stop, target: plan.target, size, riskUsd, opened: b.t + 300, why: plan.why, live };
+            book.dayTrades++;
+            events.push({ kind: "open", position: book.open });
+          }
+        }
+      }
+      book.lastT = b.t;
+      if (i % 12 === 0 || i === bars.length - 1) { book.curve.push([b.t, round(book.equity)]); if (book.curve.length > 1500) book.curve.splice(0, book.curve.length - 1500); }
+    }
+    return events;
+  }
+  A.step = step;
+
+  /** Leaderboard figures for one agent's book. */
+  function bookStats(book, { liveOnly = false } = {}) {
+    const t = liveOnly ? book.trades.filter((x) => x.live) : book.trades;
+    const wins = t.filter((x) => x.net > 0), losses = t.filter((x) => x.net <= 0);
+    const sumW = wins.reduce((s, x) => s + x.net, 0), sumL = -losses.reduce((s, x) => s + x.net, 0);
+    return { trades: t.length, winRate: t.length ? wins.length / t.length : null, avgR: t.length ? t.reduce((s, x) => s + x.R, 0) / t.length : null,
+      payoff: wins.length && losses.length && sumL ? (sumW / wins.length) / (sumL / losses.length) : null, profitFactor: sumL ? sumW / sumL : wins.length ? Infinity : null,
+      pnl: t.reduce((s, x) => s + x.net, 0), returnPct: (book.equity / RULES.equity - 1) * 100, maxDDPct: book.maxDD * 100, equity: book.equity, open: book.open };
+  }
+  A.bookStats = bookStats;
+  /** Rank agents: return, consistency and drawdown, with enough trades to mean something. */
+  function agentScore(s) {
+    if (!s.trades) return 0;
+    const pf = Math.min(isFinite(s.profitFactor) ? s.profitFactor || 0 : 3, 3) / 3, wr = s.winRate || 0, ret = Math.max(-1, Math.min(1, s.returnPct / 20));
+    return Math.round(100 * Math.max(0, 0.4 * pf + 0.25 * wr + 0.35 * (ret + 1) / 2) * Math.min(1, s.trades / 15) * (1 - Math.min(0.5, s.maxDDPct / 40)));
+  }
+  A.agentScore = agentScore;
+
+  // ================================================================ the Claude strategist (one decision per hour)
+
+  function marketSummary(bars, ind, ctx) {
+    const i = bars.length - 1, b = bars[i], h = (n) => bars.slice(-n);
+    const chg = (n) => ((b.c / bars[Math.max(0, i - n)].c - 1) * 100).toFixed(2) + "%";
+    const hourly = [];
+    for (let j = Math.max(0, i - 576); j <= i; j += 12) { const w = bars.slice(j, j + 12); if (w.length) hourly.push([new Date(w[0].t * 1000).toISOString().slice(5, 16), w[0].o, Math.max(...w.map((x) => x.h)), Math.min(...w.map((x) => x.l)), w[w.length - 1].c].map((x) => (typeof x === "number" ? Math.round(x) : x))); }
+    return {
+      now_utc: new Date((b.t + 300) * 1000).toISOString(), price: b.c, change: { "1h": chg(12), "4h": chg(48), "24h": chg(288) },
+      indicators_5m: { ema20: Math.round(ind.ema20[i]), ema50: Math.round(ind.ema50[i]), ema200: Math.round(ind.ema200[i]), rsi14: round(ind.rsi[i], 1), atr14: Math.round(ind.atr[i]), bollinger: [Math.round(ind.lower[i]), Math.round(ind.upper[i])] },
+      range_24h: [Math.round(Math.min(...h(288).map((x) => x.l))), Math.round(Math.max(...h(288).map((x) => x.h)))],
+      hyperliquid_funding_per_hour: ctx.funding, top_trader_long_share: ctx.longShare,
+      whale_anomalies_last_6h: (ctx.anomalies || []).filter((x) => x.time > b.t - 6 * 3600).slice(-15).map((x) => ({ severity: x.severity, bias: x.bias, title: x.title })),
+      hourly_ohlc_last_48h: hourly,
+    };
+  }
+  A.marketSummary = marketSummary;
+
+  const PLAN_SCHEMA = { type: "object", additionalProperties: false, required: ["action", "stop", "target", "confidence", "why"],
+    properties: { action: { type: "string", enum: ["long", "short", "wait"] }, stop: { type: "number" }, target: { type: "number" }, confidence: { type: "number" }, why: { type: "string" } } };
+
+  /** Ask Claude for one decision. Returns a plan for step() or null (wait). */
+  async function claudeDecide(summary, apiKey, fetchFn = A.fetch) {
+    const res = await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2026-10-21", "anthropic-beta": "server-side-fallback-2026-07-01" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5", max_tokens: 16000, fallbacks: "default",
+        output_config: { effort: "medium", format: { type: "json_schema", schema: PLAN_SCHEMA } },
+        system: "You are a disciplined BTC intraday trader running a paper account. Every hour you see the market snapshot and decide one thing: open a long, open a short, or wait. Trade only clear setups; waiting is the default. Any trade needs a stop beyond recent structure and a target at least 1.5 times the risk away, both as absolute BTC prices. Positions are closed by stop, target, or 23:55 UTC. Give the reason in one sentence. confidence is 0 to 1.",
+        messages: [{ role: "user", content: JSON.stringify(summary) }],
+      }),
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error((j.error && j.error.message) || `Anthropic API answered HTTP ${res.status}`);
+    if (j.stop_reason === "refusal") return null;
+    const text = (j.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
+    const d = JSON.parse(text);
+    if (d.action === "wait") return { wait: true, why: d.why };
+    return { side: d.action, stop: d.stop, target: d.target, why: `${d.why} (confidence ${Math.round(d.confidence * 100)}%)` };
+  }
+  A.claudeDecide = claudeDecide;
+  A.PLAN_SCHEMA = PLAN_SCHEMA;
+
+  // ================================================================ the agent desk: every agent over the same bars
+
+  /** Backtest all rule agents over history, then keep stepping them live. state = {books: {id: book}} */
+  function runDesk(state, bars, ctx, { live = false } = {}) {
+    const ind = indicators(bars);
+    const events = [];
+    for (const ag of AGENTS) {
+      const book = state.books[ag.id] = state.books[ag.id] || newBook(ag.id);
+      const ev = step(book, bars, ind, (bs, i, id) => ag.decide({ bars: bs, i, ind: id, ctx }), { live });
+      for (const e of ev) events.push(Object.assign({ agent: ag.id, name: ag.name }, e));
+    }
+    return events;
+  }
+  A.runDesk = runDesk;
+
+  function leaderboard(state) {
+    const list = AGENTS.concat(state.books.claude ? [LLM_AGENT] : []).map((ag) => {
+      const book = state.books[ag.id] || newBook(ag.id), s = bookStats(book), live = bookStats(book, { liveOnly: true });
+      return { id: ag.id, name: ag.name, style: ag.style, llm: !!ag.llm, stats: s, live, score: agentScore(s), curve: book.curve, open: book.open, recent: book.trades.slice(-25).reverse() };
+    });
+    return list.sort((a, b) => b.score - a.score);
+  }
+  A.leaderboard = leaderboard;
+
+  if (typeof module !== "undefined" && module.exports) module.exports = A;
+  else root.Agents = A;
+})(typeof window !== "undefined" ? window : globalThis);
+
+return module.exports; })();
 
 // ---------------------------------------------------------------- configuration
 const env = process.env;
@@ -765,7 +1108,7 @@ function netflowCheck() {
 }
 
 // ---------------------------------------------------------------- slow-moving data, cached for the app
-const cache = { holders: null, perps: null, macro: null };
+const cache = { holders: null, perps: null, macro: null, traders: null, agents: null, lb: null };
 async function refreshHolders() {
   const out = [];
   for (const a of X.HOLDERS.concat(kvGet("holders", []))) { try { out.push(await X.holder(a, price)); } catch (e) { out.push({ address: a, error: e.message }); } }
@@ -781,7 +1124,9 @@ async function refreshPerps(withTraders) {
   try { p.aster = await X.asterMarket("BTCUSDT"); } catch (e) { p.asterError = e.message; }
   if (withTraders) {
     try {
-      const top = X.topTraders(await X.hlLeaderboard(), "month", 30);
+      const lbRaw = await X.hlLeaderboard();
+      cache.lb = X.topTraders(lbRaw, "month", 300);
+      const top = cache.lb.slice(0, 30);
       for (const t of top) { try { Object.assign(t, await X.hlPositions(t.address)); } catch (e) { t.error = e.message; } }
       p.traders = top; p.pos = X.positioning(top, "BTC"); p.tradersAt = Math.floor(Date.now() / 1000);
     } catch (e) { p.tradersError = e.message; }
@@ -797,6 +1142,84 @@ async function refreshMacro() {
   cache.macro = m;
 }
 const every = (ms, fn) => { const run = () => fn().catch((e) => log("job failed:", e.message)); run(); return setInterval(run, ms); };
+
+// ---------------------------------------------------------------- top human traders: rank by real closed trades, alert on followed ones
+async function refreshTraders() {
+  if (!cache.lb) return;
+  const cand = cache.lb.filter((t) => t.accountValue >= 50000).slice(0, 60);
+  const ranked = await AG.rankTraders(cand, { days: 30, minTrades: 20 });
+  cache.traders = { at: Math.floor(Date.now() / 1000), rows: ranked.slice(0, 40) };
+}
+let followWs = null;
+function openFollowStream() {
+  const follows = kvGet("follows", []);
+  try { followWs && followWs.close(); } catch {}
+  if (!follows.length || !globalThis.WebSocket) return;
+  const ws = (followWs = new WebSocket("wss://api.hyperliquid.xyz/ws"));
+  ws.onopen = () => { for (const f of follows) ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "userFills", user: f.address } })); status.copy = `live · ${follows.length} followed`; };
+  ws.onmessage = (m) => {
+    let j; try { j = JSON.parse(m.data); } catch { return; }
+    if (j.channel !== "userFills" || !j.data || j.data.isSnapshot) return;
+    const f = follows.find((x) => x.address.toLowerCase() === String(j.data.user).toLowerCase()), name = (f && f.name) || X.short(j.data.user);
+    const log = kvGet("copyFeed", []);
+    for (const fill of j.data.fills || []) {
+      const item = { time: Math.floor(fill.time / 1000), user: j.data.user, name, coin: fill.coin, dir: fill.dir, px: +fill.px, sz: +fill.sz, pnl: +(fill.closedPnl || 0), text: AG.fillAlert(name, fill) };
+      log.push(item); broadcast("copy", item);
+      if (!f || f.coins === "all" || fill.coin === "BTC") tgSend("👤 COPY: " + item.text + `
+https://app.hyperliquid.xyz/explorer/address/${j.data.user}`);
+    }
+    kvSet("copyFeed", log.slice(-300));
+  };
+  ws.onclose = () => { status.copy = "reconnecting"; setTimeout(openFollowStream, 5000); };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+function follow(address, name, on) {
+  let list = kvGet("follows", []).filter((f) => f.address.toLowerCase() !== address.toLowerCase());
+  if (on) list.push({ address, name: name || X.short(address), coins: "BTC", since: Math.floor(Date.now() / 1000) });
+  list = list.slice(-10);                                // Hyperliquid allows a handful of user streams per connection
+  kvSet("follows", list); openFollowStream();
+  return list;
+}
+
+// ---------------------------------------------------------------- AI agent desk: BTC paper trading, 5-minute bars
+let deskBars = [], claudePlan = null, claudeNext = 0;
+async function refreshDesk() {
+  const state = kvGet("desk", null) || { books: {}, created: Math.floor(Date.now() / 1000) };
+  const fresh = await AG.candles("BTC", "5m", deskBars.length ? 6 : 24 * 14);
+  const byT = new Map(deskBars.map((b) => [b.t, b]));
+  for (const b of fresh) byT.set(b.t, b);
+  const nowS = Math.floor(Date.now() / 1000);
+  deskBars = [...byT.values()].filter((b) => b.t + 300 <= nowS).sort((a, b) => a.t - b.t).slice(-4500);
+  if (deskBars.length < 300) return;
+  const anomalies = rows("SELECT data FROM anomalies WHERE time > ?", deskBars[0].t);
+  const ctx = { funding: cache.perps && cache.perps.hl ? cache.perps.hl.funding : null, longShare: cache.perps && cache.perps.pos ? cache.perps.pos.longShare : null, anomalies };
+  const live = Object.keys(state.books).length > 0;      // the first run is the backtest
+  const events = AG.runDesk(state, deskBars, ctx, { live });
+  // the Claude strategist: one decision an hour, managed bar by bar like the others
+  if (S.anthropicKey) {
+    const book = state.books.claude = state.books.claude || Object.assign(AG.newBook("claude"), { lastT: deskBars[deskBars.length - 2].t });
+    if (!book.open && Date.now() >= claudeNext) {
+      claudeNext = Date.now() + 3600e3;
+      try { claudePlan = await AG.claudeDecide(AG.marketSummary(deskBars, AG.indicators(deskBars), ctx), S.anthropicKey); state.lastClaude = { at: nowS, decision: claudePlan }; } catch (e) { state.lastClaude = { at: nowS, error: e.message }; }
+    }
+    const lastI = deskBars.length - 1, plan = claudePlan && !claudePlan.wait ? claudePlan : null;
+    for (const e of AG.step(book, deskBars, AG.indicators(deskBars), (bs, i) => (i === lastI ? plan : null), { live: true })) events.push(Object.assign({ agent: "claude", name: AG.LLM_AGENT.name }, e));
+    claudePlan = null;
+  }
+  kvSet("desk", state);
+  const board = AG.leaderboard(state);
+  cache.agents = { at: nowS, bars: deskBars.length, from: deskBars[0].t, board, lastClaude: state.lastClaude || null };
+  // alerts: trades of the current top agent (or every agent with /agentalerts all)
+  const mode = kvGet("agentAlerts", "top");
+  if (live && mode !== "off") for (const e of events) {
+    if (mode === "top" && board[0] && e.agent !== board[0].id) continue;
+    const msg = e.kind === "open" ? `🤖 ${e.name} opened ${e.position.side.toUpperCase()} BTC @ ${X.fmtNum(e.position.entry, 0)} · stop ${X.fmtNum(e.position.stop, 0)} · target ${X.fmtNum(e.position.target, 0)}
+${e.position.why}`
+      : `🤖 ${e.name} closed ${e.trade.side.toUpperCase()} BTC @ ${X.fmtNum(e.trade.exit, 0)} (${e.trade.exitWhy}) · ${e.trade.R > 0 ? "+" : ""}${e.trade.R}R · $${X.fmtNum(e.trade.net, 0)}`;
+    tgSend(msg + "\n(paper trade, not advice)");
+    broadcast("agent", e);
+  }
+}
 
 // ---------------------------------------------------------------- Telegram
 const tg = (method, body) => CFG.telegramToken ? fetch(`https://api.telegram.org/bot${CFG.telegramToken}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json()) : Promise.resolve(null);
@@ -832,9 +1255,14 @@ async function onTelegram(msg) {
   if (cmd === "/perps") { const p = cache.perps || {}; return tgSend(p.hl ? `Hyperliquid BTC ${X.fmtNum(p.hl.mark, 0)} · funding ${(p.hl.funding * 100).toFixed(4)}%/h · OI ${X.fmtUsd(p.hl.oiUsd)}${p.pos && p.pos.traders ? `\nTop traders ${(p.pos.longShare * 100).toFixed(0)}% long BTC (${p.pos.traders} positions, median ${p.pos.medianLeverage}x)` : ""}` : "Still loading."); }
   if (cmd === "/odds") return tgSend(cache.macro && cache.macro.markets ? cache.macro.markets.slice(0, 10).map((m) => `${m.event}: ${m.question} ${m.yes != null ? Math.round(m.yes * 100) + "%" : ""}`).join("\n") : "Still loading.");
   if (cmd === "/brief") { tgSend("Reading the last 24 hours…"); try { return tgSend(await briefText()); } catch (e) { return tgSend("Briefing failed: " + e.message); } }
+  if (cmd === "/traders") return tgSend(cache.traders ? "Top traders (30 days, closed trades):\n" + cache.traders.rows.slice(0, 10).map((t, i) => `${i + 1}. ${t.name || X.short(t.address)} · score ${t.score} · win ${Math.round(t.stats.winRate * 100)}% · RR ${t.stats.payoff ? t.stats.payoff.toFixed(2) : "—"} · ${t.stats.trades} trades · ${X.fmtUsd(t.stats.pnl)}\n   ${t.address}`).join("\n") + "\n\n/follow <address> to get their trades" : "Still ranking: the first list is ready about an hour after start.");
+  if (cmd === "/follow" && args[0]) { const l = follow(args[0], args.slice(1).join(" "), true); return tgSend(`Following ${l.length} trader(s). You'll get their BTC trades here.`); }
+  if (cmd === "/unfollow" && args[0]) { follow(args[0], "", false); return tgSend("Unfollowed."); }
+  if (cmd === "/agents") return tgSend(cache.agents ? "AI agents (BTC paper trading):\n" + cache.agents.board.map((a, i) => `${i + 1}. ${a.name} · ${a.stats.returnPct >= 0 ? "+" : ""}${a.stats.returnPct.toFixed(1)}% · win ${a.stats.winRate != null ? Math.round(a.stats.winRate * 100) + "%" : "—"} · PF ${a.stats.profitFactor != null && isFinite(a.stats.profitFactor) ? a.stats.profitFactor.toFixed(2) : "—"} · ${a.stats.trades} trades${a.open ? ` · OPEN ${a.open.side}` : ""}`).join("\n") : "Agents are warming up.");
+  if (cmd === "/agentalerts") { const m = ["top", "all", "off"].includes(args[0]) ? args[0] : "top"; kvSet("agentAlerts", m); return tgSend(`Agent trade alerts: ${m}.`); }
   if (cmd === "/mute") { const h = parseFloat(args[0]) || 2; kvSet("muteUntil", Date.now() + h * 3600e3); return tgSend(`Muted for ${h} hours.`); }
   if (cmd === "/unmute") { kvSet("muteUntil", 0); return tgSend("Alerts back on."); }
-  return tgSend("Commands: /status /flows /whales /perps /odds /brief /mute 2h /unmute");
+  return tgSend("Commands: /status /flows /whales /perps /odds /brief /traders /follow <addr> /unfollow <addr> /agents /agentalerts top|all|off /mute 2h /unmute");
 }
 async function telegramLoop() {
   if (!CFG.telegramToken) return;
@@ -894,6 +1322,24 @@ function serve(req, res) {
     let body = ""; req.on("data", (c) => (body += c)); req.on("end", () => { try { const { address, name, kind } = JSON.parse(body); db.prepare("INSERT INTO labels(address, name, kind, entity, source, seen, added) VALUES(?, ?, ?, ?, 'yours', 0, ?) ON CONFLICT(address) DO UPDATE SET name = excluded.name, kind = excluded.kind, entity = excluded.entity, source = 'yours'").run(/^0x/i.test(address) ? address.toLowerCase() : address, name, kind || "exchange", name.split(/\s/)[0], Math.floor(Date.now() / 1000)); loadLabels(); json(res, 200, { ok: true }); } catch (e) { json(res, 400, { error: e.message }); } });
     return;
   }
+  if (p === "/api/traders") return json(res, 200, cache.traders || { rows: [] , pending: true });
+  if (p === "/api/follows") return json(res, 200, { follows: kvGet("follows", []), feed: kvGet("copyFeed", []).slice(-100).reverse() });
+  if (p === "/api/follow" && req.method === "POST") { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { try { const { address, name, on } = JSON.parse(b); json(res, 200, { follows: follow(address, name, on !== false) }); } catch (e) { json(res, 400, { error: e.message }); } }); return; }
+  if (p === "/api/trader") {
+    const a = q("address"); if (!/^0x[0-9a-fA-F]{40}$/.test(a || "")) return json(res, 400, { error: "address required" });
+    Promise.all([AG.fills(a, 30), AG.candles("BTC", "1h", 24 * 30)]).then(([f, c]) => {
+      const st = AG.traderStats(f), btc = f.filter((x) => x.coin === "BTC").map((x) => ({ t: Math.floor(x.time / 1000), dir: x.dir, px: +x.px, sz: +x.sz, pnl: +(x.closedPnl || 0) }));
+      json(res, 200, { address: a, stats: st, score: AG.copyScore(st), btcFills: btc.slice(-400), candles: c, following: kvGet("follows", []).some((x) => x.address.toLowerCase() === a.toLowerCase()) });
+    }, (e) => json(res, 502, { error: e.message }));
+    return;
+  }
+  if (p === "/api/agents") return json(res, 200, cache.agents ? Object.assign({}, cache.agents, { board: cache.agents.board.map((x) => Object.assign({}, x, { recent: x.recent.slice(0, 10) })), alerts: kvGet("agentAlerts", "top") } ) : { board: [], pending: true });
+  if (p === "/api/agent") {
+    const st = kvGet("desk", null), id = q("id"), book = st && st.books[id];
+    if (!book) return json(res, 404, { error: "unknown agent" });
+    return json(res, 200, { id, trades: book.trades.slice(-150), open: book.open, curve: book.curve, bars: deskBars.slice(-576) });
+  }
+  if (p === "/api/agentalerts" && req.method === "POST") { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { const m = JSON.parse(b || "{}").mode; kvSet("agentAlerts", ["top", "all", "off"].includes(m) ? m : "top"); json(res, 200, { mode: kvGet("agentAlerts") }); }); return; }
   if (p === "/api/brief") { briefText().then((text) => json(res, 200, { text }), (e) => json(res, 400, { error: e.message })); return; }
   if (p === "/api/stream") {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive", "X-Accel-Buffering": "no" });
@@ -919,6 +1365,9 @@ function start() {
   every(5 * 60e3, () => refreshPerps(false));
   setTimeout(() => every(60 * 60e3, () => refreshPerps(true)), 20000);
   every(15 * 60e3, refreshMacro);
+  setTimeout(() => every(5 * 60e3, refreshDesk), 30000);
+  setTimeout(() => every(60 * 60e3, refreshTraders), 120000);
+  openFollowStream();
   setInterval(netflowCheck, 10 * 60e3);
   setInterval(dailyDigest, 5 * 60e3);
   setInterval(() => { const cut = Math.floor(Date.now() / 1000) - CFG.keepDays * 86400; db.prepare("DELETE FROM events WHERE time < ?").run(cut); db.prepare("DELETE FROM anomalies WHERE time < ?").run(cut); }, 6 * 3600e3);
@@ -927,4 +1376,4 @@ function start() {
   if (CFG.telegramChat) tgSend("🐻 TraderGze Intel server started. /status for details.");
 }
 if (require.main === module) start();
-module.exports = { serve, addEvents, learnFromBtc, netflowCheck, db, CFG, onTelegram, cache };
+module.exports = { serve, addEvents, learnFromBtc, netflowCheck, db, CFG, onTelegram, cache, refreshDesk, refreshTraders, follow, kvGet };
