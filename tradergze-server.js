@@ -199,14 +199,16 @@ const X = (function () { const module = { exports: {} };
 
   const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
   const TOKENS = {
-    ethereum: { "0xdac17f958d2ee523a2206206994597c13d831ec7": ["USDT", 6], "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": ["USDC", 6] },
-    bsc: { "0x55d398326f99059ff775485246999027b3197955": ["USDT", 18], "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": ["USDC", 18] },
+    ethereum: { "0xdac17f958d2ee523a2206206994597c13d831ec7": ["USDT", 6], "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": ["USDC", 6],
+      "0x6b175474e89094c44da98b954eedeac495271d0f": ["DAI", 18], "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409": ["FDUSD", 18], "0x6c3ea9036406852006290770bedfcaba0e23a0e8": ["PYUSD", 6], "0x4c9edd5852cd905f086c759e8383e09bff1e68b3": ["USDe", 18] },
+    bsc: { "0x55d398326f99059ff775485246999027b3197955": ["USDT", 18], "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": ["USDC", 18], "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409": ["FDUSD", 18] },
     polygon: { "0xc2132d05d31c914a87c6611c10748aeb04b58e8f": ["USDT", 6], "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": ["USDC", 6], "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": ["USDC", 6] },
   };
   const EXPLORER = { bitcoin: "https://mempool.space/tx/", ethereum: "https://etherscan.io/tx/", bsc: "https://bscscan.com/tx/", polygon: "https://polygonscan.com/tx/", tron: "https://tronscan.org/#/transaction/" };
   const ADDR_URL = { bitcoin: "https://mempool.space/address/", ethereum: "https://etherscan.io/address/", bsc: "https://bscscan.com/address/", polygon: "https://polygonscan.com/address/", tron: "https://tronscan.org/#/address/" };
   const CHAIN_NAME = { bitcoin: "Bitcoin", ethereum: "Ethereum", bsc: "BNB Chain", polygon: "Polygon", tron: "Tron", hyperliquid: "Hyperliquid" };
-  Object.assign(I, { TOKENS, EXPLORER, ADDR_URL, CHAIN_NAME });
+  const STABLES = ["USDT", "USDC", "DAI", "FDUSD", "PYUSD", "USDe"];
+  Object.assign(I, { TOKENS, EXPLORER, ADDR_URL, CHAIN_NAME, STABLES });
 
   /** eth_getLogs results -> transfers at or above min dollars. */
   function stableFromLogs(chain, logs, blockTimes = {}, min = Settings.stableMin) {
@@ -649,13 +651,14 @@ const AG = (function () { const module = { exports: {} };
     return r.json();
   };
   A.fetch = (...a) => fetch(...a);
+  A.post = (body) => post(body);
   const round = (x, d = 2) => (x == null || !isFinite(x) ? null : Math.round(x * 10 ** d) / 10 ** d);
 
   // ================================================================ 1. top human traders
 
   /** A trader's fills -> closed-trade statistics (Hyperliquid reports closedPnl on closing fills). */
   function traderStats(fills, coin = null) {
-    const fs = (fills || []).filter((f) => !coin || f.coin === coin).slice().sort((a, b) => a.time - b.time);
+    const fs = (fills || []).filter((f) => !coin || (typeof coin === "function" ? coin(f.coin) : f.coin === coin)).slice().sort((a, b) => a.time - b.time);
     // group closing fills of the same order into one trade
     const closes = new Map();
     for (const f of fs) {
@@ -701,7 +704,20 @@ const AG = (function () { const module = { exports: {} };
   async function fills(user, days = 30) {
     return post({ type: "userFillsByTime", user, startTime: Date.now() - days * 86400e3, aggregateByTime: true });
   }
-  A.fills = fills;
+  /** Score one trader's fills in several categories at once: cats = {name: [coinFilter, minTrades]}. */
+  function scoreCategories(c, f, cats) {
+    const out = {};
+    for (const [k, [flt, minT]] of Object.entries(cats)) {
+      const s = traderStats(f, flt), sc = copyScore(s, minT);
+      if (sc > 0) {
+        const n = {}; for (const x of f) if (flt(x.coin)) n[x.coin] = (n[x.coin] || 0) + 1;
+        const eq = s.equity, step = Math.max(1, Math.ceil(eq.length / 40));
+        out[k] = Object.assign({}, c, { curve: eq.filter((_, i) => i % step === 0 || i === eq.length - 1), stats: Object.assign({}, s, { equity: undefined, recent: undefined }), score: sc, coins: Object.entries(n).sort((a, b) => b[1] - a[1]).slice(0, 5).map((x) => x[0]) });
+      }
+    }
+    return out;
+  }
+  A.fills = fills; A.scoreCategories = scoreCategories;
 
   /** Rank leaderboard traders by their real closed trades. candidates: [{address, name, accountValue, pnl}] */
   async function rankTraders(candidates, { days = 30, coin = null, minTrades = 20, onProgress } = {}) {
@@ -977,6 +993,475 @@ const AG = (function () { const module = { exports: {} };
 })(typeof window !== "undefined" ? window : globalThis);
 
 return module.exports; })();
+const MK = (function () { const module = { exports: {} };
+// TraderGze markets: the multi-asset watchlist (indices, stocks, commodities, energy, crypto, FX and
+// rates) and chart data, read on the server from Yahoo Finance's chart endpoints.
+(function (root) {
+  "use strict";
+  const M = {};
+  M.fetch = (...a) => fetch(...a);
+  const UA = { "User-Agent": "Mozilla/5.0 (compatible; TraderGze/1.0)" };
+
+  // ---------------------------------------------------------------- the watchlist
+  // [symbol, short code, name]
+  const GROUPS = [
+    ["Americas", [["^GSPC", "SPX", "S&P 500"], ["^NDX", "NDX", "Nasdaq 100"], ["^DJI", "DJIA", "Dow Jones Industrial Average"], ["^DJT", "DJT", "Dow Jones Transportation"], ["^RUT", "RUT", "Russell 2000"], ["^GSPTSE", "TSX", "S&P/TSX Composite"], ["^BVSP", "BVSP", "Bovespa"]]],
+    ["Europe", [["^FTSE", "FTSE", "FTSE 100"], ["^GDAXI", "DAX", "DAX"], ["^FCHI", "CAC", "CAC 40"], ["^STOXX50E", "SX5E", "Euro Stoxx 50"], ["^SSMI", "SMI", "Swiss Market Index"]]],
+    ["Asia-Pacific", [["^N225", "NKY", "Nikkei 225"], ["^HSI", "HSI", "Hang Seng Index"], ["000001.SS", "SHCOMP", "Shanghai Composite"], ["^KS11", "KOSPI", "KOSPI"], ["^AXJO", "ASX", "ASX 200"], ["^BSESN", "SENSEX", "BSE Sensex"]]],
+    ["Volatility & rates", [["^VIX", "VIX", "CBOE Volatility Index"], ["^TNX", "US10Y", "US 10-year yield"], ["^FVX", "US5Y", "US 5-year yield"], ["^IRX", "US3M", "US 13-week bill"], ["DX-Y.NYB", "DXY", "US Dollar Index"]]],
+    ["Mega-cap stocks", [["AAPL", "AAPL", "Apple"], ["MSFT", "MSFT", "Microsoft"], ["NVDA", "NVDA", "Nvidia"], ["AMZN", "AMZN", "Amazon"], ["GOOGL", "GOOGL", "Alphabet"], ["META", "META", "Meta Platforms"], ["TSLA", "TSLA", "Tesla"], ["AVGO", "AVGO", "Broadcom"], ["BRK-B", "BRK.B", "Berkshire Hathaway"], ["JPM", "JPM", "JPMorgan Chase"]]],
+    ["Metals & agriculture", [["GC=F", "GOLD", "Gold"], ["SI=F", "SILVER", "Silver"], ["HG=F", "COPPER", "Copper"], ["PL=F", "PLAT", "Platinum"], ["ZC=F", "CORN", "Corn"], ["ZW=F", "WHEAT", "Wheat"], ["ZS=F", "SOY", "Soybeans"], ["KC=F", "COFFEE", "Coffee"]]],
+    ["Energy", [["CL=F", "WTI", "WTI crude oil"], ["BZ=F", "BRENT", "Brent crude oil"], ["NG=F", "NATGAS", "Natural gas"], ["RB=F", "RBOB", "Gasoline (RBOB)"], ["HO=F", "HEAT", "Heating oil"], ["XLE", "XLE", "Energy Select Sector ETF"], ["XOM", "XOM", "Exxon Mobil"], ["CVX", "CVX", "Chevron"]]],
+    ["Crypto", [["BTC-USD", "BTC", "Bitcoin"], ["ETH-USD", "ETH", "Ethereum"], ["SOL-USD", "SOL", "Solana"], ["XRP-USD", "XRP", "XRP"], ["BNB-USD", "BNB", "BNB"]]],
+    ["FX", [["EURUSD=X", "EURUSD", "Euro / US dollar"], ["GBPUSD=X", "GBPUSD", "British pound / US dollar"], ["JPY=X", "USDJPY", "US dollar / Japanese yen"], ["CHF=X", "USDCHF", "US dollar / Swiss franc"], ["AUDUSD=X", "AUDUSD", "Australian dollar / US dollar"], ["INR=X", "USDINR", "US dollar / Indian rupee"]]],
+  ];
+  M.GROUPS = GROUPS;
+  M.ALL = GROUPS.flatMap(([g, rows]) => rows.map(([sym, code, name]) => ({ sym, code, name, group: g })));
+  const CUR = { USD: "$", EUR: "€", GBP: "£", GBp: "p", JPY: "¥", CNY: "CN¥", HKD: "HK$", KRW: "₩", AUD: "A$", INR: "₹", CAD: "CA$", BRL: "R$", CHF: "CHF " };
+  M.CUR = CUR;
+
+  // ---------------------------------------------------------------- Yahoo readers
+  const hosts = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"];
+  async function yget(path) {
+    let last;
+    for (const h of hosts) {
+      try {
+        const r = await M.fetch(h + path, { headers: UA });
+        if (r.status === 429 || r.status >= 500) { last = new Error(`Yahoo answered HTTP ${r.status}`); continue; }
+        if (!r.ok) throw new Error(`Yahoo answered HTTP ${r.status}`);
+        return await r.json();
+      } catch (e) { last = e; }
+    }
+    throw last;
+  }
+  M.yget = yget;
+
+  /** Market open / pre-post / closed from a Yahoo meta block, at time now (seconds). */
+  function marketState(meta, now = Date.now() / 1000) {
+    const p = meta && meta.currentTradingPeriod;
+    if (!p || !p.regular) return "unknown";
+    const inP = (x) => x && now >= x.start && now < x.end;
+    if (inP(p.regular)) return "open";
+    if (inP(p.pre) || inP(p.post)) return "extended";
+    return "closed";
+  }
+  M.marketState = marketState;
+
+  /** One Yahoo chart result -> a watchlist row (last, change, day range, sparkline). */
+  function rowFrom(res, item, now) {
+    const m = res.meta || {}, q = ((res.indicators || {}).quote || [{}])[0] || {};
+    const closes = (q.close || []).map((c, i) => [res.timestamp ? res.timestamp[i] : i, c]).filter((x) => x[1] != null);
+    const last = m.regularMarketPrice != null ? m.regularMarketPrice : closes.length ? closes[closes.length - 1][1] : null;
+    const prev = m.chartPreviousClose != null ? m.chartPreviousClose : m.previousClose;
+    const hi = q.high ? Math.max(...q.high.filter((x) => x != null)) : null, lo = q.low ? Math.min(...q.low.filter((x) => x != null)) : null;
+    return Object.assign({}, item, {
+      last, prev, change: last != null && prev ? last - prev : null, changePct: last != null && prev ? (last / prev - 1) * 100 : null,
+      high: m.regularMarketDayHigh || (isFinite(hi) ? hi : null), low: m.regularMarketDayLow || (isFinite(lo) ? lo : null),
+      currency: m.currency || "USD", state: marketState(m, now), time: m.regularMarketTime || null,
+      spark: closes.length > 60 ? closes.filter((_, i) => i % Math.ceil(closes.length / 60) === 0).map((x) => +x[1].toFixed(6)) : closes.map((x) => +x[1].toFixed(6)),
+    });
+  }
+  M.rowFrom = rowFrom;
+
+  /** Watchlist rows for every symbol (Yahoo v8 chart, one day of 5-minute bars each). */
+  async function watchlist(items = M.ALL, { concurrency = 6, now } = {}) {
+    const out = new Array(items.length);
+    let k = 0;
+    const worker = async () => {
+      while (k < items.length) {
+        const i = k++, it = items[i];
+        try {
+          const j = await yget(`/v8/finance/chart/${encodeURIComponent(it.sym)}?range=1d&interval=5m&includePrePost=false`);
+          const res = j.chart && j.chart.result && j.chart.result[0];
+          out[i] = res ? rowFrom(res, it, now) : Object.assign({}, it, { error: "no data" });
+        } catch (e) { out[i] = Object.assign({}, it, { error: e.message }); }
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, worker));
+    return out;
+  }
+  M.watchlist = watchlist;
+
+  const RANGES = { "1D": ["1d", "5m"], "5D": ["5d", "30m"], "1M": ["1mo", "1h"], "6M": ["6mo", "1d"], "1Y": ["1y", "1d"], "2Y": ["2y", "1d"], "5Y": ["5y", "1wk"] };
+  M.RANGES = RANGES;
+  /** Candles for a symbol: [{t, o, h, l, c, v}] oldest first. */
+  async function candles(sym, range = "6M") {
+    const [r, iv] = RANGES[range] || RANGES["6M"];
+    const j = await yget(`/v8/finance/chart/${encodeURIComponent(sym)}?range=${r}&interval=${iv}&includePrePost=false`);
+    const res = j.chart && j.chart.result && j.chart.result[0];
+    if (!res) throw new Error(`no chart data for ${sym}`);
+    const q = res.indicators.quote[0];
+    return { meta: { currency: res.meta.currency, name: res.meta.longName || res.meta.shortName, exchange: res.meta.exchangeName, state: marketState(res.meta) },
+      bars: (res.timestamp || []).map((t, i) => ({ t, o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i], v: q.volume ? q.volume[i] || 0 : 0 })).filter((b) => b.o != null && b.c != null && b.h != null && b.l != null) };
+  }
+  M.candles = candles;
+
+  if (typeof module !== "undefined" && module.exports) module.exports = M;
+  else root.Markets = M;
+})(typeof window !== "undefined" ? window : globalThis);
+
+return module.exports; })();
+const SC = (function () { const module = { exports: {} };
+// TraderGze opportunity scanner: textbook setups with the whole trade planned before entry
+// (entry, stop, target, reward-to-risk), scored and tracked to see which setups actually work.
+(function (root) {
+  "use strict";
+  const S = {};
+
+  // ---------------------------------------------------------------- indicators on [{t,o,h,l,c,v}]
+  const ema = (xs, n) => { const k = 2 / (n + 1); let e = null; return xs.map((x) => (e = e == null ? x : x * k + e * (1 - k))); };
+  function atr(bars, n = 14) {
+    const tr = bars.map((b, i) => (i ? Math.max(b.h - b.l, Math.abs(b.h - bars[i - 1].c), Math.abs(b.l - bars[i - 1].c)) : b.h - b.l));
+    let a = null; return tr.map((x, i) => (a = i < n ? tr.slice(0, i + 1).reduce((s, y) => s + y, 0) / (i + 1) : (a * (n - 1) + x) / n));
+  }
+  /** Swing pivots: bar i is a high pivot if its high is the highest of k bars each side. */
+  function pivots(bars, k = 3) {
+    const hi = [], lo = [];
+    for (let i = k; i < bars.length - k; i++) {
+      const w = bars.slice(i - k, i + k + 1);
+      if (bars[i].h === Math.max(...w.map((b) => b.h))) hi.push(i);
+      if (bars[i].l === Math.min(...w.map((b) => b.l))) lo.push(i);
+    }
+    return { hi, lo };
+  }
+  /** Session VWAP over intraday bars (resets each UTC day of the bar's exchange session). */
+  function vwap(bars) {
+    let pv = 0, vol = 0, day = null;
+    return bars.map((b) => {
+      const d = Math.floor(b.t / 86400);
+      if (d !== day) { pv = 0; vol = 0; day = d; }
+      const v = b.v || 1, tp = (b.h + b.l + b.c) / 3;
+      pv += tp * v; vol += v; return pv / vol;
+    });
+  }
+  Object.assign(S, { ema, atr, pivots, vwap });
+
+  const plan = (side, entry, stop, target) => {
+    const risk = side === "long" ? entry - stop : stop - entry, reward = side === "long" ? target - entry : entry - target;
+    return risk > 0 && reward > 0 ? { side, entry, stop, target, rr: reward / risk } : null;
+  };
+  S.plan = plan;
+
+  // ---------------------------------------------------------------- the setups
+  // each returns null or { setup, side, entry, stop, target, rr, trigger: "now" | "stop order" | "limit order", why, book }
+  const SETUPS = {
+    /** Pullback to the 20/50 EMA inside an established trend, then the bar closes back with the trend. */
+    emaPullback(b) {
+      if (b.length < 210) return null;
+      const c = b.map((x) => x.c), e20 = ema(c, 20), e50 = ema(c, 50), e200 = ema(c, 200), a = atr(b), i = b.length - 1, x = b[i];
+      const up = e50[i] > e200[i] && c[i] > e50[i] && e50[i] > e50[i - 10], dn = e50[i] < e200[i] && c[i] < e50[i] && e50[i] < e50[i - 10];
+      const swingHi = Math.max(...b.slice(-30).map((y) => y.h)), swingLo = Math.min(...b.slice(-30).map((y) => y.l));
+      if (up && x.l <= e20[i] + 0.25 * a[i] && x.c > e20[i] && x.c > x.o) {
+        const entry = x.h + 0.05 * a[i], stop = Math.min(x.l, e50[i]) - 0.3 * a[i], p = plan("long", entry, stop, Math.max(swingHi, entry + 2 * (entry - stop)));
+        return p && Object.assign(p, { setup: "EMA pullback", trigger: "stop order", why: `Uptrend (EMA50 above EMA200 and rising). Price pulled back to the 20 EMA and closed back up. Buy above this bar's high; stop under the 50 EMA / bar low; target the recent swing high or 2R.`, book: "Murphy, Technical Analysis of the Financial Markets — trading pullbacks to moving averages in a trend" });
+      }
+      if (dn && x.h >= e20[i] - 0.25 * a[i] && x.c < e20[i] && x.c < x.o) {
+        const entry = x.l - 0.05 * a[i], stop = Math.max(x.h, e50[i]) + 0.3 * a[i], p = plan("short", entry, stop, Math.min(swingLo, entry - 2 * (stop - entry)));
+        return p && Object.assign(p, { setup: "EMA pullback", trigger: "stop order", why: `Downtrend (EMA50 below EMA200 and falling). Price rallied to the 20 EMA and closed back down. Sell below this bar's low; stop above the 50 EMA / bar high; target the recent swing low or 2R.`, book: "Murphy, Technical Analysis of the Financial Markets — trading pullbacks to moving averages in a trend" });
+      }
+      return null;
+    },
+    /** Close through a trendline drawn across the last two falling swing highs (or rising swing lows). */
+    trendlineBreak(b) {
+      if (b.length < 60) return null;
+      const { hi, lo } = pivots(b.slice(0, -1), 3), a = atr(b), i = b.length - 1, x = b[i], prev = b[i - 1];
+      const avgV = b.slice(-21, -1).reduce((s, y) => s + (y.v || 0), 0) / 20, volOk = !avgV || (x.v || 0) >= 1.2 * avgV;
+      const line = (p1, p2, k) => p1.y + ((p2.y - p1.y) * (k - p1.i)) / (p2.i - p1.i);
+      if (hi.length >= 2) {
+        const [i1, i2] = hi.slice(-2), p1 = { i: i1, y: b[i1].h }, p2 = { i: i2, y: b[i2].h };
+        if (p2.y < p1.y && i - i2 <= 30 && i2 - i1 >= 5) {
+          const lv = line(p1, p2, i), lvPrev = line(p1, p2, i - 1);
+          if (x.c > lv && prev.c <= lvPrev && volOk) {
+            const low = Math.min(...b.slice(i1, i + 1).map((y) => y.l)), stop = Math.max(low, x.c - 2 * a[i]) - 0.2 * a[i];
+            const p = plan("long", x.c, stop, x.c + Math.max(p1.y - low, 2 * (x.c - stop)));
+            return p && Object.assign(p, { setup: "Trendline breakout", trigger: "now", line: [[b[i1].t, p1.y], [x.t, lv]], why: `Closed above the down-trendline joining the ${new Date(b[i1].t * 1000).toISOString().slice(0, 10)} and ${new Date(b[i2].t * 1000).toISOString().slice(0, 10)} highs${avgV ? " on above-average volume" : ""}. Stop under the swing low inside the pattern; target the measured move (pattern height) or 2R.`, book: "Murphy, Technical Analysis of the Financial Markets — trendline breaks and measured moves" });
+          }
+        }
+      }
+      if (lo.length >= 2) {
+        const [i1, i2] = lo.slice(-2), p1 = { i: i1, y: b[i1].l }, p2 = { i: i2, y: b[i2].l };
+        if (p2.y > p1.y && i - i2 <= 30 && i2 - i1 >= 5) {
+          const lv = line(p1, p2, i), lvPrev = line(p1, p2, i - 1);
+          if (x.c < lv && prev.c >= lvPrev && volOk) {
+            const high = Math.max(...b.slice(i1, i + 1).map((y) => y.h)), stop = Math.min(high, x.c + 2 * a[i]) + 0.2 * a[i];
+            const p = plan("short", x.c, stop, x.c - Math.max(high - p1.y, 2 * (stop - x.c)));
+            return p && Object.assign(p, { setup: "Trendline breakdown", trigger: "now", line: [[b[i1].t, p1.y], [x.t, lv]], why: `Closed below the up-trendline joining the ${new Date(b[i1].t * 1000).toISOString().slice(0, 10)} and ${new Date(b[i2].t * 1000).toISOString().slice(0, 10)} lows. Stop above the swing high inside the pattern; target the measured move or 2R.`, book: "Murphy, Technical Analysis of the Financial Markets — trendline breaks and measured moves" });
+          }
+        }
+      }
+      return null;
+    },
+    /** Turtle-style 55-bar channel breakout. */
+    channelBreakout(b) {
+      if (b.length < 60) return null;
+      const a = atr(b, 20), i = b.length - 1, x = b[i], w = b.slice(i - 55, i), hh = Math.max(...w.map((y) => y.h)), ll = Math.min(...w.map((y) => y.l));
+      if (x.c > hh && b[i - 1].c <= hh) { const p = plan("long", x.c, x.c - 2 * a[i], x.c + 4 * a[i]); return p && Object.assign(p, { setup: "55-bar breakout", trigger: "now", why: `New 55-bar closing high above ${hh.toFixed(2)}. Stop 2 ATR (the Turtles' "2N"); target 4 ATR, or trail the 20-bar low.`, book: "Curtis Faith, Way of the Turtle — 55-day breakout, 2N stop" }); }
+      if (x.c < ll && b[i - 1].c >= ll) { const p = plan("short", x.c, x.c + 2 * a[i], x.c - 4 * a[i]); return p && Object.assign(p, { setup: "55-bar breakdown", trigger: "now", why: `New 55-bar closing low below ${ll.toFixed(2)}. Stop 2 ATR; target 4 ATR, or trail the 20-bar high.`, book: "Curtis Faith, Way of the Turtle — 55-day breakout, 2N stop" }); }
+      return null;
+    },
+    /** Price coming back to the 200 EMA from one side: a planned limit order at the big moving average. */
+    bigMaTest(b) {
+      if (b.length < 220) return null;
+      const c = b.map((x) => x.c), e200 = ema(c, 200), a = atr(b), i = b.length - 1, x = b[i], d = (x.c - e200[i]) / a[i];
+      const above = c.slice(-40).every((y, k) => y > e200[i - 39 + k]), below = c.slice(-40).every((y, k) => y < e200[i - 39 + k]);
+      const swingHi = Math.max(...b.slice(-40).map((y) => y.h)), swingLo = Math.min(...b.slice(-40).map((y) => y.l));
+      if (above && d > 0 && d < 1.5) { const p = plan("long", e200[i], e200[i] - 1.2 * a[i], swingHi); return p && p.rr >= 1.5 && Object.assign(p, { setup: "200 EMA support", trigger: "limit order", why: `Above the 200 EMA for 40+ bars and now ${d.toFixed(1)} ATR from it. Big funds defend the 200: plan a buy limit at the line, stop 1.2 ATR under, target the recent high.`, book: "Brent Donnelly, Alpha Trader — plan levels in advance; trade the levels everyone watches" }); }
+      if (below && d < 0 && d > -1.5) { const p = plan("short", e200[i], e200[i] + 1.2 * a[i], swingLo); return p && p.rr >= 1.5 && Object.assign(p, { setup: "200 EMA resistance", trigger: "limit order", why: `Below the 200 EMA for 40+ bars and now ${(-d).toFixed(1)} ATR from it. Plan a sell limit at the line, stop 1.2 ATR above, target the recent low.`, book: "Brent Donnelly, Alpha Trader — plan levels in advance; trade the levels everyone watches" }); }
+      return null;
+    },
+  };
+  /** Intraday: price reclaims (or loses) session VWAP in the direction of the daily trend. */
+  function vwapSetup(m5, dailyTrend) {
+    if (!m5 || m5.length < 30 || !dailyTrend) return null;
+    const vw = vwap(m5), a = atr(m5, 14), i = m5.length - 1, x = m5[i], day = Math.floor(x.t / 86400);
+    const today = m5.filter((b) => Math.floor(b.t / 86400) === day);
+    if (today.length < 6) return null;
+    const below = m5.slice(-7, -1).filter((b, k) => b.c < vw[i - 6 + k]).length, above = 6 - below;
+    if (dailyTrend === "up" && x.c > vw[i] && below >= 4) {
+      const lo = Math.min(...today.map((b) => b.l)), stop = Math.max(lo, vw[i] - 2 * a[i]) - 0.2 * a[i], p = plan("long", x.c, stop, x.c + 2 * (x.c - stop));
+      return p && Object.assign(p, { setup: "VWAP reclaim", tf: "5m", trigger: "now", why: "Daily trend is up; price was below session VWAP and just reclaimed it. Stop under the session low (or 2 ATR); target 2R. Exit by the close.", book: "VWAP is the benchmark institutions execute against; Alpha Trader — know where the market's average buyer is" });
+    }
+    if (dailyTrend === "down" && x.c < vw[i] && above >= 4) {
+      const hi = Math.max(...today.map((b) => b.h)), stop = Math.min(hi, vw[i] + 2 * a[i]) + 0.2 * a[i], p = plan("short", x.c, stop, x.c - 2 * (stop - x.c));
+      return p && Object.assign(p, { setup: "VWAP rejection", tf: "5m", trigger: "now", why: "Daily trend is down; price was above session VWAP and just lost it. Stop over the session high (or 2 ATR); target 2R. Exit by the close.", book: "VWAP is the benchmark institutions execute against; Alpha Trader — know where the market's average buyer is" });
+    }
+    return null;
+  }
+  S.SETUPS = SETUPS; S.vwapSetup = vwapSetup;
+
+  const trendOf = (b) => { if (b.length < 60) return null; const c = b.map((x) => x.c), e20 = ema(c, 20), e50 = ema(c, 50), i = c.length - 1; return c[i] > e50[i] && e20[i] > e50[i] ? "up" : c[i] < e50[i] && e20[i] < e50[i] ? "down" : null; };
+  S.trendOf = trendOf;
+
+  /** Every setup that fires on the latest bar of a symbol. daily = 1y of daily bars, m5 = intraday bars (optional). */
+  function scanSymbol(item, daily, m5, { minRR = 1.5 } = {}) {
+    const out = [], last = daily[daily.length - 1];
+    for (const [k, fn] of Object.entries(SETUPS)) {
+      let o; try { o = fn(daily); } catch { o = null; }
+      if (o && o.rr >= minRR) out.push(Object.assign({ tf: "1D", key: k }, o));
+    }
+    const v = vwapSetup(m5, trendOf(daily));
+    if (v && v.rr >= minRR) out.push(Object.assign({ key: "vwap" }, v));
+    const bar = (o) => (o.tf === "5m" ? m5[m5.length - 1] : last);
+    return out.map((o) => Object.assign(o, { sym: item.sym, code: item.code, name: item.name, group: item.group, time: bar(o).t, last: bar(o).c, id: `${item.sym}:${o.key}:${o.side}:${bar(o).t}` }));
+  }
+  S.scanSymbol = scanSymbol;
+
+  /** Settle a tracked idea against bars after it was found: filled? stopped? target hit? Stops win ties (conservative). */
+  function settle(o, bars) {
+    if (o.result && o.result !== "open" && o.result !== "pending") return o;
+    const after = bars.filter((b) => b.t > o.time), long = o.side === "long";
+    let filled = o.trigger === "now" ? true : !!o.filled;
+    for (const b of after) {
+      if (!filled) {
+        if (o.trigger === "stop order" ? (long ? b.h >= o.entry : b.l <= o.entry) : (long ? b.l <= o.entry : b.h >= o.entry)) filled = true;
+        else { if (b.t - o.time > 10 * 86400) return Object.assign(o, { result: "expired" }); continue; }
+      }
+      if (long ? b.l <= o.stop : b.h >= o.stop) return Object.assign(o, { filled, result: "loss", R: -1, closed: b.t });
+      if (long ? b.h >= o.target : b.l <= o.target) return Object.assign(o, { filled, result: "win", R: +o.rr.toFixed(2), closed: b.t });
+    }
+    return Object.assign(o, { filled, result: filled ? "open" : "pending" });
+  }
+  S.settle = settle;
+
+  /** Per-setup scoreboard from settled ideas. */
+  function scoreboard(history) {
+    const by = {};
+    for (const o of history) {
+      if (o.result !== "win" && o.result !== "loss") continue;
+      const s = (by[o.setup] = by[o.setup] || { setup: o.setup, trades: 0, wins: 0, R: 0, gross: 0, loss: 0 });
+      s.trades++; s.R += o.R; if (o.R > 0) { s.wins++; s.gross += o.R; } else s.loss += -o.R;
+    }
+    return Object.values(by).map((s) => Object.assign(s, { winRate: s.wins / s.trades, expectancy: s.R / s.trades, profitFactor: s.loss ? s.gross / s.loss : null })).sort((a, b) => b.expectancy - a.expectancy);
+  }
+  S.scoreboard = scoreboard;
+
+  if (typeof module !== "undefined" && module.exports) module.exports = S;
+  else root.Scanner = S;
+})(typeof window !== "undefined" ? window : globalThis);
+
+return module.exports; })();
+const RS = (function () { const module = { exports: {} };
+// TraderGze research feeds, read on the server: the week's economic calendar, CFTC positioning,
+// insider buying, superinvestor 13F changes, a reading library with live RSS, and trader categories.
+(function (root) {
+  "use strict";
+  const R = {};
+  R.fetch = (...a) => fetch(...a);
+  R.UA = "TraderGze Intel (self-hosted) admin@localhost";
+  async function get(url, type = "json", headers = {}) {
+    const r = await R.fetch(url, { headers: Object.assign({ "User-Agent": R.UA, Accept: type === "json" ? "application/json" : "*/*" }, headers) });
+    if (!r.ok) throw new Error(`${new URL(url).host} answered HTTP ${r.status}`);
+    return type === "json" ? r.json() : r.text();
+  }
+  R.get = get;
+  const strip = (s) => String(s || "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  R.strip = strip;
+
+  // ---------------------------------------------------------------- economic calendar (Forex Factory weekly export)
+  /** This week's events: [{title, country, time, impact, forecast, previous}] sorted by time. */
+  async function calendar() {
+    const j = await get("https://nfs.faireconomy.media/ff_calendar_thisweek.json");
+    return parseCalendar(j);
+  }
+  function parseCalendar(j) {
+    return (j || []).map((e) => ({ title: e.title, country: e.country, time: Math.floor(Date.parse(e.date) / 1000), impact: e.impact, forecast: e.forecast || "", previous: e.previous || "", actual: e.actual || "" }))
+      .filter((e) => isFinite(e.time)).sort((a, b) => a.time - b.time);
+  }
+  Object.assign(R, { calendar, parseCalendar });
+
+  // ---------------------------------------------------------------- CFTC Commitments of Traders (disaggregated, futures only)
+  const COT = [
+    ["088691", "Gold", "metals"], ["084691", "Silver", "metals"], ["085692", "Copper", "metals"], ["076651", "Platinum", "metals"],
+    ["067651", "WTI crude oil", "energy"], ["023651", "Natural gas (Henry Hub)", "energy"], ["111659", "Gasoline (RBOB)", "energy"], ["022651", "Heating oil (ULSD)", "energy"],
+    ["002602", "Corn", "ags"], ["001602", "Wheat (SRW)", "ags"], ["005602", "Soybeans", "ags"], ["083731", "Coffee", "ags"],
+  ];
+  R.COT = COT;
+  /** Managed money (hedge funds / CTAs) and producer net positions, last 26 weeks per market. */
+  async function cot() {
+    const codes = COT.map((c) => `'${c[0]}'`).join(",");
+    const url = `https://publicreporting.cftc.gov/resource/72hh-3qpy.json?$where=${encodeURIComponent(`cftc_contract_market_code in(${codes})`)}&$order=${encodeURIComponent("report_date_as_yyyy_mm_dd DESC")}&$limit=${COT.length * 30}`;
+    return parseCot(await get(url));
+  }
+  function parseCot(rows) {
+    const n = (x) => Number(x || 0);
+    return COT.map(([code, name, kind]) => {
+      const hist = rows.filter((r) => r.cftc_contract_market_code === code).map((r) => ({
+        date: String(r.report_date_as_yyyy_mm_dd).slice(0, 10), oi: n(r.open_interest_all),
+        mm: n(r.m_money_positions_long_all) - n(r.m_money_positions_short_all), prod: n(r.prod_merc_positions_long_all) - n(r.prod_merc_positions_short_all),
+      })).sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-26);
+      const last = hist[hist.length - 1], prev = hist[hist.length - 2];
+      const mms = hist.map((h) => h.mm), lo = Math.min(...mms), hi = Math.max(...mms);
+      return { code, name, kind, hist, last, change: last && prev ? last.mm - prev.mm : null, mmPctile: last && hi > lo ? (last.mm - lo) / (hi - lo) : null };
+    }).filter((m) => m.last);
+  }
+  Object.assign(R, { cot, parseCot });
+
+  // ---------------------------------------------------------------- insider buying (OpenInsider)
+  /** Latest open-market insider purchases: [{filed, traded, ticker, company, insider, title, type, price, qty, value}] */
+  async function insiders(url = "http://openinsider.com/latest-insider-purchases-25k") { return parseInsiders(await get(url, "text")); }
+  function parseInsiders(html) {
+    const t = (html.match(/<table[^>]*class="tinytable"[^>]*>([\s\S]*?)<\/table>/i) || [])[1] || "";
+    const rows = [...t.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)].map((m) => [...m[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((c) => strip(c[1])));
+    const num = (s) => Number(String(s).replace(/[$,+]/g, "")) || 0;
+    return rows.filter((c) => c.length >= 13).map((c) => ({ filed: c[1], traded: c[2], ticker: c[3], company: c[4], insider: c[5], title: c[6], type: c[7], price: num(c[8]), qty: num(c[9]), owned: c[10], deltaOwn: c[11], value: num(c[12]) }));
+  }
+  Object.assign(R, { insiders, parseInsiders });
+
+  // ---------------------------------------------------------------- superinvestor 13F (SEC EDGAR)
+  const FUNDS = [
+    ["0001067983", "Berkshire Hathaway", "Warren Buffett"], ["0001649339", "Scion Asset Management", "Michael Burry"], ["0001336528", "Pershing Square", "Bill Ackman"],
+    ["0001536411", "Duquesne Family Office", "Stanley Druckenmiller"], ["0001656456", "Appaloosa", "David Tepper"], ["0001350694", "Bridgewater Associates", "Ray Dalio's firm"],
+    ["0000949509", "Oaktree Capital", "Howard Marks"], ["0001709323", "Himalaya Capital", "Li Lu"], ["0001061768", "Baupost Group", "Seth Klarman"], ["0001040273", "Third Point", "Dan Loeb"],
+  ];
+  R.FUNDS = FUNDS;
+  /** Parse a 13F information table XML into {name -> {name, cusip, value, shares}} (puts/calls kept separate). */
+  function parse13f(xml) {
+    const out = {};
+    for (const m of xml.matchAll(/<(?:\w+:)?infoTable>([\s\S]*?)<\/(?:\w+:)?infoTable>/gi)) {
+      const g = (tag) => strip((m[1].match(new RegExp(`<(?:\\w+:)?${tag}>([\\s\\S]*?)</(?:\\w+:)?${tag}>`, "i")) || [])[1]);
+      const name = g("nameOfIssuer"), cusip = g("cusip"), pc = g("putCall"), k = cusip + (pc ? ":" + pc : "");
+      const o = (out[k] = out[k] || { name: name + (pc ? ` (${pc})` : ""), cusip, value: 0, shares: 0 });
+      o.value += Number(g("value")) || 0; o.shares += Number(g("sshPrnamt")) || 0;
+    }
+    return out;
+  }
+  /** What changed between two 13F holdings maps: new, added, trimmed, sold out. */
+  function diff13f(cur, prev) {
+    const tot = Object.values(cur).reduce((s, x) => s + x.value, 0) || 1, ch = [];
+    for (const [k, h] of Object.entries(cur)) {
+      const p = prev[k];
+      if (!p) ch.push({ name: h.name, action: "new", value: h.value, weight: h.value / tot });
+      else if (h.shares > p.shares * 1.1) ch.push({ name: h.name, action: "added", value: h.value, weight: h.value / tot, pct: h.shares / p.shares - 1 });
+      else if (h.shares < p.shares * 0.9) ch.push({ name: h.name, action: "trimmed", value: h.value, weight: h.value / tot, pct: h.shares / p.shares - 1 });
+    }
+    for (const [k, p] of Object.entries(prev)) if (!cur[k]) ch.push({ name: p.name, action: "sold out", value: p.value, weight: 0 });
+    const top = Object.values(cur).sort((a, b) => b.value - a.value).slice(0, 10).map((h) => ({ name: h.name, value: h.value, weight: h.value / tot }));
+    return { total: tot, top, changes: ch.sort((a, b) => b.value - a.value).slice(0, 15) };
+  }
+  Object.assign(R, { parse13f, diff13f });
+  async function holdingsOf(cik, acc) {
+    const dir = `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${acc.replace(/-/g, "")}`;
+    const idx = await get(dir + "/index.json");
+    const files = (idx.directory && idx.directory.item) || [];
+    const xml = files.map((f) => f.name).filter((n) => /\.xml$/i.test(n) && !/primary_doc/i.test(n));
+    for (const n of xml) { const h = parse13f(await get(`${dir}/${n}`, "text")); if (Object.keys(h).length) return h; }
+    throw new Error("no information table in " + acc);
+  }
+  /** Latest 13F of each fund vs its previous one. Slow (SEC asks for ≤10 requests a second): run daily. */
+  async function superinvestors(funds = FUNDS) {
+    const out = [];
+    for (const [cik, fund, manager] of funds) {
+      try {
+        const sub = await get(`https://data.sec.gov/submissions/CIK${cik}.json`), r = sub.filings.recent, f = [];
+        for (let i = 0; i < r.form.length && f.length < 2; i++) if (r.form[i] === "13F-HR") f.push({ acc: r.accessionNumber[i], date: r.reportDate[i], filed: r.filingDate[i] });
+        if (!f.length) throw new Error("no 13F filed");
+        const cur = await holdingsOf(cik, f[0].acc), prev = f[1] ? await holdingsOf(cik, f[1].acc) : {};
+        out.push(Object.assign({ cik, fund, manager, period: f[0].date, filed: f[0].filed, url: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cik}&type=13F` }, diff13f(cur, prev)));
+      } catch (e) { out.push({ cik, fund, manager, error: e.message }); }
+      await new Promise((ok) => setTimeout(ok, 400));
+    }
+    return out;
+  }
+  R.superinvestors = superinvestors;
+
+  // ---------------------------------------------------------------- reading library
+  const FEEDS = [
+    ["Federal Reserve press releases", "https://www.federalreserve.gov/feeds/press_all.xml", "central banks"],
+    ["ECB press", "https://www.ecb.europa.eu/rss/press.html", "central banks"],
+    ["BIS central bank speeches", "https://www.bis.org/doclist/cbspeeches.rss", "central banks"],
+    ["Aswath Damodaran — Musings on Markets", "https://aswathdamodaran.blogspot.com/feeds/posts/default", "valuation"],
+    ["Collaborative Fund (Morgan Housel)", "https://collabfund.com/blog/feed.xml", "investing"],
+    ["Farnam Street", "https://fs.blog/feed/", "thinking"],
+    ["AQR insights", "https://www.aqr.com/Insights/Research/rss", "quant"],
+    ["a16z", "https://a16z.com/feed/", "tech & crypto"],
+  ];
+  const LIBRARY = [
+    ["Investor letters & memos", [["Berkshire Hathaway shareholder letters", "https://www.berkshirehathaway.com/letters/letters.html", "Buffett's annual letters since 1977"], ["Oaktree memos (Howard Marks)", "https://www.oaktreecapital.com/insights/memos", "Cycles, risk and market psychology"], ["Bridgewater research", "https://www.bridgewater.com/research-and-insights", "Debt cycles, macro regimes"], ["GMO research", "https://www.gmo.com/americas/research-library/", "7-year asset class forecasts, valuation"], ["AQR research", "https://www.aqr.com/Insights/Research", "Factors, trend following, risk premia"], ["ARK Invest research", "https://www.ark-invest.com/research", "Disruptive tech and crypto theses"], ["J.P. Morgan Guide to the Markets", "https://am.jpmorgan.com/us/en/asset-management/adv/insights/market-insights/guide-to-the-markets/", "The quarterly chart book of the whole market"]]],
+    ["What the big money holds", [["Dataroma", "https://www.dataroma.com/m/home.php", "Superinvestor portfolios and buys"], ["WhaleWisdom", "https://whalewisdom.com/", "13F filings of every fund"], ["13f.info", "https://13f.info/", "Clean 13F holdings tables"], ["SEC EDGAR", "https://www.sec.gov/edgar/search/", "The source filings: 13F, Form 4, 10-K"], ["OpenInsider", "http://openinsider.com/", "Insider buys and sells (Form 4)"], ["Capitol Trades", "https://www.capitoltrades.com/trades", "US Congress members' stock trades"]]],
+    ["Macro data", [["FRED", "https://fred.stlouisfed.org/", "Every US macro series: rates, real yields, inflation"], ["Federal Reserve", "https://www.federalreserve.gov/", "FOMC statements, minutes, dot plot"], ["ECB", "https://www.ecb.europa.eu/", "Euro area policy"], ["BIS", "https://www.bis.org/", "Global liquidity, central bank research"], ["Trading Economics", "https://tradingeconomics.com/", "Indicators and forecasts for every country"], ["Forex Factory calendar", "https://www.forexfactory.com/calendar", "The week's market-moving releases"]]],
+    ["Stocks & valuation", [["Damodaran Online", "https://pages.stern.nyu.edu/~adamodar/", "Equity risk premium, sector multiples, valuation classes"], ["Macrotrends", "https://www.macrotrends.net/", "Long-term charts of stocks and macro"], ["Stock Analysis", "https://stockanalysis.com/", "Financials, ETFs, IPOs"], ["Finviz", "https://finviz.com/", "Screener and market heat map"], ["TradingView", "https://www.tradingview.com/", "Charts and ideas"], ["Koyfin", "https://www.koyfin.com/", "Pro-style dashboards and charts"]]],
+    ["Thinking & process", [["Collaborative Fund blog", "https://collabfund.com/blog/", "Morgan Housel on behavior and money"], ["Farnam Street", "https://fs.blog/", "Mental models and decision making"], ["a16z", "https://a16z.com/", "Tech and crypto research"]]],
+    ["Books referenced in this app", [["Alpha Trader — Brent Donnelly", "https://www.goodreads.com/search?q=alpha+trader+donnelly", "Process, risk, planning trades before entry, narrative and correlation regimes"], ["Way of the Turtle — Curtis Faith", "https://www.goodreads.com/search?q=way+of+the+turtle", "55-day breakouts, ATR stops and position sizing"], ["Technical Analysis of the Financial Markets — John Murphy", "https://www.goodreads.com/search?q=technical+analysis+of+the+financial+markets+murphy", "Trendlines, moving averages, measured moves"], ["Intermarket Analysis — John Murphy", "https://www.goodreads.com/search?q=intermarket+analysis+murphy", "How stocks, bonds, commodities and the dollar move together"], ["The Most Important Thing — Howard Marks", "https://www.goodreads.com/search?q=the+most+important+thing+marks", "Risk, cycles and second-level thinking"], ["Big Debt Crises — Ray Dalio", "https://www.goodreads.com/search?q=big+debt+crises", "The debt-cycle template behind macro regimes"]]],
+  ];
+  Object.assign(R, { FEEDS, LIBRARY });
+  /** RSS 2.0 or Atom -> [{title, link, time, summary}] */
+  function parseFeed(xml) {
+    const items = [...xml.matchAll(/<(item|entry)[\s>]([\s\S]*?)<\/\1>/gi)].map((m) => m[2]);
+    return items.map((it) => {
+      const g = (tag) => strip((it.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i")) || [])[1]);
+      const link = (it.match(/<link[^>]*href="([^"]+)"[^>]*\/?>(?![\s\S]*rel="replies")/i) || [])[1] || g("link") || g("guid");
+      const time = Date.parse(g("pubDate") || g("published") || g("updated") || g("dc:date"));
+      return { title: g("title"), link, time: isFinite(time) ? Math.floor(time / 1000) : null, summary: (g("description") || g("summary") || g("content")).slice(0, 280) };
+    }).filter((x) => x.title && x.link);
+  }
+  R.parseFeed = parseFeed;
+  async function readFeeds(feeds = FEEDS) {
+    const out = await Promise.all(feeds.map(async ([name, url, kind]) => { try { return { name, url, kind, items: parseFeed(await get(url, "text")).slice(0, 8) }; } catch (e) { return { name, url, kind, items: [], error: e.message }; } }));
+    return out;
+  }
+  R.readFeeds = readFeeds;
+
+  // ---------------------------------------------------------------- Hyperliquid market categories
+  const METALS = ["GOLD", "SILVER", "COPPER", "PLATINUM", "PALLADIUM", "XAU", "XAG", "PAXG"];
+  const ENERGY = ["CL", "OIL", "WTI", "BRENT", "BRENTOIL", "NATGAS", "NG", "USOIL", "UKOIL", "GAS", "URANIUM"];
+  const AGS = ["CORN", "WHEAT", "SOY", "COFFEE", "COCOA", "SUGAR"];
+  const base = (coin) => String(coin).split(":").pop().toUpperCase();
+  /** "btc" | "stocks" | "commodities" | "crypto" for a Hyperliquid coin name (HIP-3 markets look like "xyz:TSLA"). */
+  function category(coin) {
+    const c = String(coin), b = base(c);
+    if (c === "BTC" || c === "UBTC") return "btc";
+    if (METALS.includes(b) || ENERGY.includes(b) || AGS.includes(b)) return "commodities";
+    if (c.includes(":")) return "stocks";
+    return "crypto";
+  }
+  R.category = category; R.base = base;
+  R.sector = (coin) => { const b = base(coin); return METALS.includes(b) ? "metals" : ENERGY.includes(b) ? "energy" : AGS.includes(b) ? "ags" : null; };
+
+  if (typeof module !== "undefined" && module.exports) module.exports = R;
+  else root.Research = R;
+})(typeof window !== "undefined" ? window : globalThis);
+
+return module.exports; })();
 
 // ---------------------------------------------------------------- configuration
 const env = process.env;
@@ -1066,7 +1551,8 @@ function addEvents(list) {
     stats.events++;
     recent.push(e); if (recent.length > 1000) recent.shift();
     broadcast("transfer", e);
-    if (e.asset === "USDT" || e.asset === "USDC") learnFromStable(e);
+    if (X.STABLES.includes(e.asset)) learnFromStable(e);
+    walletTouched(e);
     addAnomalies(X.detect(e, recent));
     if (e.asset === "BTC" && e.amount >= Math.max(S.btcMin * 2, 200)) setTimeout(() => checkAge(e), 15000);
   }
@@ -1094,7 +1580,7 @@ function addAnomalies(list) {
 function netflowCheck() {
   const now = Math.floor(Date.now() / 1000), hour = 3600;
   for (const asset of ["BTC", "stables"]) {
-    const assets = asset === "BTC" ? ["BTC"] : ["USDT", "USDC"];
+    const assets = asset === "BTC" ? ["BTC"] : X.STABLES;
     const q = db.prepare(`SELECT time / ${hour} AS h, SUM(CASE WHEN type = 'inflow' THEN usd WHEN type = 'outflow' THEN -usd ELSE 0 END) AS net FROM events WHERE time > ? AND asset IN (${assets.map(() => "?").join(",")}) GROUP BY h`).all(now - 7 * 86400, ...assets);
     const cur = Math.floor(now / hour) - 1;
     const past = q.filter((r) => r.h < cur).map((r) => r.net), last = q.find((r) => r.h === cur);
@@ -1144,11 +1630,41 @@ async function refreshMacro() {
 const every = (ms, fn) => { const run = () => fn().catch((e) => log("job failed:", e.message)); run(); return setInterval(run, ms); };
 
 // ---------------------------------------------------------------- top human traders: rank by real closed trades, alert on followed ones
+// trader categories: BTC only, stock perps (Hyperliquid HIP-3 markets such as xyz:TSLA), commodities & energy
+const CATS = { btc: [(c) => RS.category(c) === "btc", 20], stocks: [(c) => RS.category(c) === "stocks", 8], commodities: [(c) => RS.category(c) === "commodities", 8] };
+/** A stable virtual name per address: Trader1, Trader2, … in the order they were first ranked. */
+function alias(address) {
+  const m = kvGet("aliases", {}), k = address.toLowerCase();
+  if (!m[k]) { m[k] = Object.keys(m).length + 1; kvSet("aliases", m); }
+  return "Trader" + m[k];
+}
+// addresses seen trading HIP-3 (stock / commodity) markets, gathered from their recent trades
+async function collectHip3Traders() {
+  const seen = kvGet("hip3Users", {});
+  let coins = [];
+  try {
+    const dexs = (await AG.post({ type: "perpDexs" })) || [];
+    for (const d of dexs.filter((x) => x && x.name)) { try { const m = await AG.post({ type: "meta", dex: d.name }); coins.push(...(m.universe || []).filter((u) => !u.isDelisted).map((u) => u.name)); } catch {} }
+  } catch (e) { log("perpDexs:", e.message); }
+  coins = coins.filter((c) => RS.category(c) !== "crypto").slice(0, 60);
+  cache.hip3Coins = coins;
+  for (const coin of coins) {
+    try { for (const t of (await AG.post({ type: "recentTrades", coin })) || []) for (const u of t.users || []) { const k = u.toLowerCase(); seen[k] = seen[k] || { n: 0, cats: {} }; seen[k].n++; seen[k].cats[RS.category(coin)] = 1; seen[k].at = Date.now(); } } catch {}
+  }
+  const cut = Date.now() - 14 * 86400e3;
+  kvSet("hip3Users", Object.fromEntries(Object.entries(seen).filter(([, v]) => v.at > cut).sort((a, b) => b[1].n - a[1].n).slice(0, 400)));
+}
 async function refreshTraders() {
   if (!cache.lb) return;
   const cand = cache.lb.filter((t) => t.accountValue >= 50000).slice(0, 60);
-  const ranked = await AG.rankTraders(cand, { days: 30, minTrades: 20 });
-  cache.traders = { at: Math.floor(Date.now() / 1000), rows: ranked.slice(0, 40) };
+  const hip = Object.entries(kvGet("hip3Users", {})).slice(0, 60).map(([address]) => ({ address, accountValue: null, pnl: null }));
+  const seen = new Set(), all = [...cand, ...hip].filter((c) => !seen.has(c.address.toLowerCase()) && seen.add(c.address.toLowerCase()));
+  const out = { btc: [], stocks: [], commodities: [] };
+  for (const c of all) {
+    try { const r = AG.scoreCategories(c, await AG.fills(c.address, 30), CATS); for (const k in r) out[k].push(r[k]); } catch {}
+  }
+  for (const k in out) out[k] = out[k].sort((a, b) => b.score - a.score).slice(0, 40).map((t) => Object.assign(t, { name: alias(t.address), handle: t.name || null }));
+  cache.traders = { at: Math.floor(Date.now() / 1000), rows: out.btc, cats: out };
 }
 let followWs = null;
 function openFollowStream() {
@@ -1165,7 +1681,8 @@ function openFollowStream() {
     for (const fill of j.data.fills || []) {
       const item = { time: Math.floor(fill.time / 1000), user: j.data.user, name, coin: fill.coin, dir: fill.dir, px: +fill.px, sz: +fill.sz, pnl: +(fill.closedPnl || 0), text: AG.fillAlert(name, fill) };
       log.push(item); broadcast("copy", item);
-      if (!f || f.coins === "all" || fill.coin === "BTC") tgSend("👤 COPY: " + item.text + `
+      const cat = (f && f.cat) || "btc";
+      if (!f || f.coins === "all" || RS.category(fill.coin) === cat) tgSend((/^Open|>/.test(fill.dir) ? "🟢 OPENED · " : "👤 ") + item.text + `
 https://app.hyperliquid.xyz/explorer/address/${j.data.user}`);
     }
     kvSet("copyFeed", log.slice(-300));
@@ -1173,9 +1690,9 @@ https://app.hyperliquid.xyz/explorer/address/${j.data.user}`);
   ws.onclose = () => { status.copy = "reconnecting"; setTimeout(openFollowStream, 5000); };
   ws.onerror = () => { try { ws.close(); } catch {} };
 }
-function follow(address, name, on) {
+function follow(address, name, on, cat = "btc") {
   let list = kvGet("follows", []).filter((f) => f.address.toLowerCase() !== address.toLowerCase());
-  if (on) list.push({ address, name: name || X.short(address), coins: "BTC", since: Math.floor(Date.now() / 1000) });
+  if (on) list.push({ address, name: name || alias(address), cat: CATS[cat] ? cat : "btc", since: Math.floor(Date.now() / 1000) });
   list = list.slice(-10);                                // Hyperliquid allows a handful of user streams per connection
   kvSet("follows", list); openFollowStream();
   return list;
@@ -1221,6 +1738,121 @@ ${e.position.why}`
   }
 }
 
+// ---------------------------------------------------------------- opportunity scanner: textbook setups, planned in advance, tracked to the result
+const SCAN_SKIP = new Set(["Volatility & rates"]);
+const dailyCache = {};
+async function refreshScanner() {
+  const items = MK.ALL.filter((i) => !SCAN_SKIP.has(i.group)), found = [], errors = [];
+  let watch = (cache.watch && cache.watch.rows) || [];
+  for (const it of items) {
+    try {
+      let d = dailyCache[it.sym];
+      if (!d || Date.now() - d.at > 3600e3) d = dailyCache[it.sym] = { at: Date.now(), data: await MK.candles(it.sym, "2Y") };
+      const state = d.data.meta.state, bars = d.data.bars.slice();
+      const today = Math.floor(Date.now() / 86400e3);
+      if (state === "open" && bars.length && Math.floor(bars[bars.length - 1].t / 86400) === today) bars.pop();  // only completed daily bars
+      let m5 = null;
+      if (state === "open") { try { m5 = (await MK.candles(it.sym, "1D")).bars; } catch {} }
+      found.push(...SC.scanSymbol(it, bars, m5));
+      it._bars = d.data.bars;
+    } catch (e) { errors.push(`${it.code}: ${e.message}`); }
+  }
+  // track every idea to its result
+  const hist = kvGet("opps", []), known = new Set(hist.map((o) => o.id)), fresh = found.filter((o) => !known.has(o.id));
+  hist.push(...fresh);
+  for (const o of hist) { const it = items.find((x) => x.sym === o.sym); if (it && it._bars) SC.settle(o, o.tf === "5m" ? it._bars.filter((b) => b.t > o.time) : it._bars); }
+  kvSet("opps", hist.slice(-800));
+  cache.opps = { at: Math.floor(Date.now() / 1000), scanned: items.length, errors: errors.slice(0, 20) };
+  if (fresh.length && kvGet("oppAlerts", true) && kvGet("muteUntil", 0) < Date.now())
+    for (const o of fresh.slice(0, 8)) tgSend(`🎯 SETUP · ${o.code} ${o.setup} (${o.tf}) ${o.side.toUpperCase()}\nEntry ${fmtP(o.entry)} (${o.trigger}) · Stop ${fmtP(o.stop)} · Target ${fmtP(o.target)} · RR ${o.rr.toFixed(1)}\n${o.why}`);
+  for (const it of items) delete it._bars;
+}
+const fmtP = (v) => (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString("en-US") : Math.abs(v) >= 10 ? v.toFixed(2) : v.toFixed(4));
+function oppsView() {
+  const hist = kvGet("opps", []), now = Math.floor(Date.now() / 1000);
+  const active = hist.filter((o) => (o.result === "open" || o.result === "pending") && now - o.time < 12 * 86400).sort((a, b) => b.time - a.time);
+  return Object.assign({}, cache.opps || { pending: true }, { active, settled: hist.filter((o) => o.result === "win" || o.result === "loss").slice(-60).reverse(), board: SC.scoreboard(hist) });
+}
+
+// ---------------------------------------------------------------- BTC flow: hourly exchange in / out, BTC vs stablecoins
+function flowBars(hours = 48) {
+  const now = Math.floor(Date.now() / 1000), h0 = Math.floor(now / 3600) - hours + 1;
+  const r = db.prepare(`SELECT time / 3600 AS h, CASE WHEN asset = 'BTC' THEN 'btc' ELSE 'st' END AS a, type, SUM(usd) AS usd, COUNT(*) AS n FROM events WHERE time >= ? AND chain != 'hyperliquid' AND type IN ('inflow', 'outflow') GROUP BY h, a, type`).all(h0 * 3600);
+  const bars = Array.from({ length: hours }, (_, i) => ({ t: (h0 + i) * 3600, btcIn: 0, btcOut: 0, stIn: 0, stOut: 0 }));
+  for (const x of r) { const b = bars[x.h - h0]; if (b) b[x.a + (x.type === "inflow" ? "In" : "Out")] += x.usd; }
+  const byAsset = db.prepare("SELECT asset, type, SUM(usd) usd FROM events WHERE time >= ? AND chain != 'hyperliquid' AND type IN ('inflow', 'outflow') GROUP BY asset, type").all(now - 86400);
+  return { bars, byAsset };
+}
+
+// ---------------------------------------------------------------- BTC whales: exchange in / out only
+function whaleMoves(days = 7) {
+  const ev = rows("SELECT data FROM events WHERE time > ? AND asset = 'BTC' AND type IN ('inflow', 'outflow') ORDER BY time DESC LIMIT 400", Math.floor(Date.now() / 1000) - days * 86400);
+  const sum = (t, h) => ev.filter((e) => e.type === t && e.time > Date.now() / 1000 - h * 3600).reduce((s, e) => s + e.amount, 0);
+  return { moves: ev.slice(0, 150), d1: { in: sum("inflow", 24), out: sum("outflow", 24) }, d7: { in: sum("inflow", 168), out: sum("outflow", 168) }, holders: cache.holders };
+}
+
+// ---------------------------------------------------------------- personal wallet tracker
+const chainOf = (a) => (/^0x[0-9a-fA-F]{40}$/.test(a) ? "ethereum" : /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(a) ? "tron" : /^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$/.test(a) ? "bitcoin" : null);
+async function rpc(method, params) { const r = await fetch("https://ethereum-rpc.publicnode.com", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }).then((x) => x.json()); if (r.error) throw new Error(r.error.message); return r.result; }
+async function walletBalance(w) {
+  if (w.chain === "bitcoin") { const j = await fetch(`https://mempool.space/api/address/${w.address}`).then((r) => r.json()); const c = j.chain_stats, m = j.mempool_stats; return { BTC: (c.funded_txo_sum - c.spent_txo_sum + m.funded_txo_sum - m.spent_txo_sum) / 1e8, txs: c.tx_count + m.tx_count }; }
+  if (w.chain === "ethereum") {
+    const out = { ETH: Number(BigInt(await rpc("eth_getBalance", [w.address, "latest"]))) / 1e18 };
+    for (const [tok, [sym, dec]] of Object.entries(X.TOKENS.ethereum)) { try { const v = Number(BigInt(await rpc("eth_call", [{ to: tok, data: "0x70a08231" + w.address.slice(2).toLowerCase().padStart(64, "0") }, "latest"]) || "0x0")) / 10 ** dec; if (v >= 1) out[sym] = v; } catch {} }
+    return out;
+  }
+  if (w.chain === "tron") { const j = await fetch(`https://api.trongrid.io/v1/accounts/${w.address}`).then((r) => r.json()), a = (j.data || [])[0] || {}; const out = { TRX: (a.balance || 0) / 1e6 }; for (const t of a.trc20 || []) for (const [k, v] of Object.entries(t)) if (k === "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t") out.USDT = Number(v) / 1e6; return out; }
+  return {};
+}
+async function refreshWallets() {
+  const list = kvGet("wallets", []), seen = kvGet("walletSeen", {});
+  for (const w of list) {
+    try { w.balance = await walletBalance(w); w.at = Math.floor(Date.now() / 1000); w.error = null; } catch (e) { w.error = e.message; }
+    if (w.chain !== "bitcoin") continue;
+    try {   // every BTC transaction of a tracked wallet, not only whale-sized ones
+      const txs = await fetch(`https://mempool.space/api/address/${w.address}/txs`).then((r) => r.json());
+      const ids = txs.map((t) => t.txid), had = seen[w.address];
+      if (had) for (const t of txs.filter((t) => !had.includes(t.txid)).slice(0, 5)) {
+        const got = t.vout.filter((o) => o.scriptpubkey_address === w.address).reduce((s, o) => s + o.value, 0), sent = t.vin.filter((i) => i.prevout && i.prevout.scriptpubkey_address === w.address).reduce((s, i) => s + i.prevout.value, 0);
+        const net = (got - sent) / 1e8;
+        tgSend(`👛 ${w.name}: ${net >= 0 ? "received" : "sent"} ${X.fmtNum(Math.abs(net), 4)} BTC${price ? ` (${X.fmtUsd(Math.abs(net) * price)})` : ""}\nhttps://mempool.space/tx/${t.txid}`);
+      }
+      seen[w.address] = ids.slice(0, 50);
+    } catch {}
+  }
+  kvSet("wallets", list); kvSet("walletSeen", seen);
+}
+function walletTouched(e) {
+  const list = kvGet("wallets", []); if (!list.length || e.chain === "hyperliquid") return;
+  const m = list.find((w) => w.chain !== "bitcoin" && [e.from, e.to].some((a) => a && a.toLowerCase() === w.address.toLowerCase()));
+  if (m) tgSend(`👛 ${m.name}: ${e.from && e.from.toLowerCase() === m.address.toLowerCase() ? "sent" : "received"} ${X.fmtUsd(e.usd)} ${e.asset} on ${X.CHAIN_NAME[e.chain]}\n${X.EXPLORER[e.chain]}${e.hash}`);
+}
+function walletsView() {
+  return kvGet("wallets", []).map((w) => Object.assign({}, w, { events: rows("SELECT data FROM events WHERE data LIKE ? ORDER BY time DESC LIMIT 25", "%" + (w.chain === "bitcoin" ? w.address : w.address.toLowerCase()) + "%") }));
+}
+function setWallet(address, name, on) {
+  const chain = chainOf(address || "");
+  if (on && !chain) throw new Error("Not a Bitcoin, Ethereum/EVM (0x…) or Tron (T…) address");
+  let list = kvGet("wallets", []).filter((w) => w.address.toLowerCase() !== String(address).toLowerCase());
+  if (on) list.push({ address: chain === "ethereum" ? address.toLowerCase() : address, name: name || X.short(address), chain, added: Math.floor(Date.now() / 1000) });
+  kvSet("wallets", list.slice(-30));
+  if (on) refreshWallets().catch(() => {});
+  return list;
+}
+
+// ---------------------------------------------------------------- macro & research feeds (each on its own clock)
+const research = {};
+async function refreshResearch(force) {
+  const due = (k, ms) => force || !research[k] || Date.now() - research[k].at > ms;
+  const run = async (k, ms, fn) => { if (!due(k, ms)) return; try { research[k] = { at: Date.now(), data: await fn() }; } catch (e) { research[k] = { at: Date.now() - ms + 600e3, error: e.message, data: research[k] && research[k].data }; } };
+  await run("calendar", 3600e3, RS.calendar);
+  await run("insiders", 3600e3, () => RS.insiders());
+  await run("feeds", 2 * 3600e3, () => RS.readFeeds());
+  await run("cot", 12 * 3600e3, RS.cot);
+  await run("funds", 24 * 3600e3, () => RS.superinvestors());
+}
+const rsOut = (k) => (research[k] ? { at: Math.floor(research[k].at / 1000), data: research[k].data || null, error: research[k].error || null } : { pending: true });
+
 // ---------------------------------------------------------------- Telegram
 const tg = (method, body) => CFG.telegramToken ? fetch(`https://api.telegram.org/bot${CFG.telegramToken}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json()) : Promise.resolve(null);
 const tgSend = (text, chat = CFG.telegramChat) => (chat ? tg("sendMessage", { chat_id: chat, text: text.slice(0, 4000), disable_web_page_preview: true }) : null);
@@ -1246,7 +1878,7 @@ async function onTelegram(msg) {
   if (cmd === "/start") {
     if (args[0] !== CFG.key) return tgSend("Send /start followed by your ACCESS_KEY to connect this chat.", chat);
     CFG.telegramChat = chat; kvSet("telegramChat", chat);
-    return tgSend("Connected. You'll get high and critical alerts here.\nCommands: /status /flows /whales /perps /odds /brief /mute 2h /unmute", chat);
+    return tgSend("Connected. You'll get high and critical alerts here.\nCommands: /status /flows /whales /odds /brief /opps /traders /wallets /mute 2h /unmute", chat);
   }
   if (chat !== String(CFG.telegramChat)) return tgSend("This bot is private.", chat);
   if (cmd === "/status") return tgSend(`Tracking since ${new Date(stats.started).toUTCString()}\n${Object.entries(status).map(([k, v]) => `${X.CHAIN_NAME[k] || k}: ${v}`).join("\n")}\nTransfers recorded: ${db.prepare("SELECT COUNT(*) n FROM events").get().n}\nAnomalies: ${db.prepare("SELECT COUNT(*) n FROM anomalies").get().n}\nLearned exchange wallets: ${db.prepare("SELECT COUNT(*) n FROM labels WHERE source = 'learned'").get().n}`);
@@ -1255,14 +1887,19 @@ async function onTelegram(msg) {
   if (cmd === "/perps") { const p = cache.perps || {}; return tgSend(p.hl ? `Hyperliquid BTC ${X.fmtNum(p.hl.mark, 0)} · funding ${(p.hl.funding * 100).toFixed(4)}%/h · OI ${X.fmtUsd(p.hl.oiUsd)}${p.pos && p.pos.traders ? `\nTop traders ${(p.pos.longShare * 100).toFixed(0)}% long BTC (${p.pos.traders} positions, median ${p.pos.medianLeverage}x)` : ""}` : "Still loading."); }
   if (cmd === "/odds") return tgSend(cache.macro && cache.macro.markets ? cache.macro.markets.slice(0, 10).map((m) => `${m.event}: ${m.question} ${m.yes != null ? Math.round(m.yes * 100) + "%" : ""}`).join("\n") : "Still loading.");
   if (cmd === "/brief") { tgSend("Reading the last 24 hours…"); try { return tgSend(await briefText()); } catch (e) { return tgSend("Briefing failed: " + e.message); } }
-  if (cmd === "/traders") return tgSend(cache.traders ? "Top traders (30 days, closed trades):\n" + cache.traders.rows.slice(0, 10).map((t, i) => `${i + 1}. ${t.name || X.short(t.address)} · score ${t.score} · win ${Math.round(t.stats.winRate * 100)}% · RR ${t.stats.payoff ? t.stats.payoff.toFixed(2) : "—"} · ${t.stats.trades} trades · ${X.fmtUsd(t.stats.pnl)}\n   ${t.address}`).join("\n") + "\n\n/follow <address> to get their trades" : "Still ranking: the first list is ready about an hour after start.");
+  if (cmd === "/traders") return tgSend(cache.traders ? "Top BTC traders (30 days, closed trades):\n" + cache.traders.rows.slice(0, 10).map((t, i) => `${i + 1}. ${t.name || X.short(t.address)} · score ${t.score} · win ${Math.round(t.stats.winRate * 100)}% · RR ${t.stats.payoff ? t.stats.payoff.toFixed(2) : "—"} · ${t.stats.trades} trades · ${X.fmtUsd(t.stats.pnl)}\n   ${t.address}`).join("\n") + "\n\n/follow <address> to get their trades" : "Still ranking: the first list is ready about an hour after start.");
   if (cmd === "/follow" && args[0]) { const l = follow(args[0], args.slice(1).join(" "), true); return tgSend(`Following ${l.length} trader(s). You'll get their BTC trades here.`); }
   if (cmd === "/unfollow" && args[0]) { follow(args[0], "", false); return tgSend("Unfollowed."); }
   if (cmd === "/agents") return tgSend(cache.agents ? "AI agents (BTC paper trading):\n" + cache.agents.board.map((a, i) => `${i + 1}. ${a.name} · ${a.stats.returnPct >= 0 ? "+" : ""}${a.stats.returnPct.toFixed(1)}% · win ${a.stats.winRate != null ? Math.round(a.stats.winRate * 100) + "%" : "—"} · PF ${a.stats.profitFactor != null && isFinite(a.stats.profitFactor) ? a.stats.profitFactor.toFixed(2) : "—"} · ${a.stats.trades} trades${a.open ? ` · OPEN ${a.open.side}` : ""}`).join("\n") : "Agents are warming up.");
   if (cmd === "/agentalerts") { const m = ["top", "all", "off"].includes(args[0]) ? args[0] : "top"; kvSet("agentAlerts", m); return tgSend(`Agent trade alerts: ${m}.`); }
+  if (cmd === "/opps") { const v = oppsView(); return tgSend(v.active.length ? "Live setups (entry · stop · target · RR):\n" + v.active.slice(0, 15).map((o) => `${o.code} ${o.side.toUpperCase()} ${o.setup} ${o.tf} · ${fmtP(o.entry)} · ${fmtP(o.stop)} · ${fmtP(o.target)} · ${o.rr.toFixed(1)}R${o.result === "open" ? " · filled" : ""}`).join("\n") : "No live setups right now. The scanner runs every 15 minutes."); }
+  if (cmd === "/oppalerts") { const on = args[0] !== "off"; kvSet("oppAlerts", on); return tgSend(`New-setup alerts ${on ? "on" : "off"}.`); }
+  if (cmd === "/wallets") { const l = kvGet("wallets", []); return tgSend(l.length ? l.map((w) => `${w.name} (${w.chain}): ${Object.entries(w.balance || {}).filter(([k]) => k !== "txs").map(([k, v]) => `${X.fmtNum(v, k === "BTC" ? 4 : 0)} ${k}`).join(", ") || "—"}`).join("\n") : "No tracked wallets. /track <address> <name>"); }
+  if (cmd === "/track" && args[0]) { try { setWallet(args[0], args.slice(1).join(" "), true); return tgSend("Tracking. You'll get its moves here."); } catch (e) { return tgSend(e.message); } }
+  if (cmd === "/untrack" && args[0]) { setWallet(args[0], "", false); return tgSend("Stopped tracking."); }
   if (cmd === "/mute") { const h = parseFloat(args[0]) || 2; kvSet("muteUntil", Date.now() + h * 3600e3); return tgSend(`Muted for ${h} hours.`); }
   if (cmd === "/unmute") { kvSet("muteUntil", 0); return tgSend("Alerts back on."); }
-  return tgSend("Commands: /status /flows /whales /perps /odds /brief /traders /follow <addr> /unfollow <addr> /agents /agentalerts top|all|off /mute 2h /unmute");
+  return tgSend("Commands: /status /flows /whales /odds /brief /opps /oppalerts on|off /traders /follow <addr> /unfollow <addr> /wallets /track <addr> <name> /untrack <addr> /mute 2h /unmute");
 }
 async function telegramLoop() {
   if (!CFG.telegramToken) return;
@@ -1317,20 +1954,46 @@ function serve(req, res) {
   if (p === "/api/holders") return json(res, 200, cache.holders || { rows: [] });
   if (p === "/api/perps") return json(res, 200, cache.perps || {});
   if (p === "/api/macro") return json(res, 200, cache.macro || {});
+  if (p === "/api/watch") {
+    const now = Date.now();
+    if (!cache.watch || now - cache.watch.at > 60000) { if (!cache.watchP) cache.watchP = MK.watchlist().then((rows) => (cache.watch = { at: Date.now(), rows })).finally(() => (cache.watchP = null)); }
+    if (cache.watch) return json(res, 200, { groups: MK.GROUPS.map((g) => g[0]), ...cache.watch });
+    cache.watchP.then(() => json(res, 200, { groups: MK.GROUPS.map((g) => g[0]), ...cache.watch }), (e) => json(res, 502, { error: e.message }));
+    return;
+  }
+  if (p === "/api/chart") {
+    const sym = q("symbol"), range = q("range") || "6M", k = sym + "|" + range;
+    cache.charts = cache.charts || {};
+    const hit = cache.charts[k];
+    if (hit && Date.now() - hit.at < (range === "1D" ? 60000 : 600000)) return json(res, 200, hit.data);
+    MK.candles(sym, range).then((data) => { cache.charts[k] = { at: Date.now(), data }; json(res, 200, data); }, (e) => json(res, 502, { error: e.message }));
+    return;
+  }
+  if (p === "/api/opps") return json(res, 200, Object.assign(oppsView(), { alerts: kvGet("oppAlerts", true) }));
+  if (p === "/api/oppalerts" && req.method === "POST") { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { kvSet("oppAlerts", !!JSON.parse(b || "{}").on); json(res, 200, { alerts: kvGet("oppAlerts") }); }); return; }
+  if (p === "/api/flowbars") return json(res, 200, flowBars(Math.min(168, +q("hours", 48))));
+  if (p === "/api/whales") return json(res, 200, whaleMoves());
+  if (p === "/api/wallets" && req.method === "GET") return json(res, 200, { wallets: walletsView() });
+  if (p === "/api/wallets" && req.method === "POST") { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { try { const { address, name, on } = JSON.parse(b); setWallet(String(address || "").trim(), name, on !== false); json(res, 200, { wallets: walletsView() }); } catch (e) { json(res, 400, { error: e.message }); } }); return; }
+  if (p === "/api/research") return json(res, 200, { calendar: rsOut("calendar"), insiders: rsOut("insiders"), feeds: rsOut("feeds"), cot: rsOut("cot"), funds: rsOut("funds"), library: RS.LIBRARY, odds: cache.macro || {} });
   if (p === "/api/labels" && req.method === "GET") return json(res, 200, db.prepare("SELECT * FROM labels ORDER BY seen DESC LIMIT 2000").all());
   if (p === "/api/labels" && req.method === "POST") {
     let body = ""; req.on("data", (c) => (body += c)); req.on("end", () => { try { const { address, name, kind } = JSON.parse(body); db.prepare("INSERT INTO labels(address, name, kind, entity, source, seen, added) VALUES(?, ?, ?, ?, 'yours', 0, ?) ON CONFLICT(address) DO UPDATE SET name = excluded.name, kind = excluded.kind, entity = excluded.entity, source = 'yours'").run(/^0x/i.test(address) ? address.toLowerCase() : address, name, kind || "exchange", name.split(/\s/)[0], Math.floor(Date.now() / 1000)); loadLabels(); json(res, 200, { ok: true }); } catch (e) { json(res, 400, { error: e.message }); } });
     return;
   }
-  if (p === "/api/traders") return json(res, 200, cache.traders || { rows: [] , pending: true });
+  if (p === "/api/traders") return json(res, 200, cache.traders || { rows: [], cats: { btc: [], stocks: [], commodities: [] }, pending: true });
   if (p === "/api/follows") return json(res, 200, { follows: kvGet("follows", []), feed: kvGet("copyFeed", []).slice(-100).reverse() });
-  if (p === "/api/follow" && req.method === "POST") { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { try { const { address, name, on } = JSON.parse(b); json(res, 200, { follows: follow(address, name, on !== false) }); } catch (e) { json(res, 400, { error: e.message }); } }); return; }
+  if (p === "/api/follow" && req.method === "POST") { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { try { const { address, name, on, cat } = JSON.parse(b); json(res, 200, { follows: follow(address, name, on !== false, cat) }); } catch (e) { json(res, 400, { error: e.message }); } }); return; }
   if (p === "/api/trader") {
     const a = q("address"); if (!/^0x[0-9a-fA-F]{40}$/.test(a || "")) return json(res, 400, { error: "address required" });
-    Promise.all([AG.fills(a, 30), AG.candles("BTC", "1h", 24 * 30)]).then(([f, c]) => {
-      const st = AG.traderStats(f), btc = f.filter((x) => x.coin === "BTC").map((x) => ({ t: Math.floor(x.time / 1000), dir: x.dir, px: +x.px, sz: +x.sz, pnl: +(x.closedPnl || 0) }));
-      json(res, 200, { address: a, stats: st, score: AG.copyScore(st), btcFills: btc.slice(-400), candles: c, following: kvGet("follows", []).some((x) => x.address.toLowerCase() === a.toLowerCase()) });
-    }, (e) => json(res, 502, { error: e.message }));
+    const cat = CATS[q("cat")] ? q("cat") : "btc", flt = CATS[cat][0];
+    AG.fills(a, 30).then(async (f) => {
+      const n = {}; for (const x of f) if (flt(x.coin)) n[x.coin] = (n[x.coin] || 0) + 1;
+      const coin = q("coin") || Object.entries(n).sort((x, y) => y[1] - x[1]).map((x) => x[0])[0] || (cat === "btc" ? "BTC" : null);
+      const c = coin ? await AG.candles(coin, "1h", 24 * 30).catch(() => []) : [];
+      const st = AG.traderStats(f, flt), mine = f.filter((x) => x.coin === coin).map((x) => ({ t: Math.floor(x.time / 1000), dir: x.dir, px: +x.px, sz: +x.sz, pnl: +(x.closedPnl || 0) }));
+      json(res, 200, { address: a, name: alias(a), cat, coin, coins: Object.keys(n), stats: st, score: AG.copyScore(st, CATS[cat][1]), btcFills: mine.slice(-400), candles: c, following: kvGet("follows", []).some((x) => x.address.toLowerCase() === a.toLowerCase()) });
+    }).catch((e) => json(res, 502, { error: e.message }));
     return;
   }
   if (p === "/api/agents") return json(res, 200, cache.agents ? Object.assign({}, cache.agents, { board: cache.agents.board.map((x) => Object.assign({}, x, { recent: x.recent.slice(0, 10) })), alerts: kvGet("agentAlerts", "top") } ) : { board: [], pending: true });
@@ -1365,8 +2028,11 @@ function start() {
   every(5 * 60e3, () => refreshPerps(false));
   setTimeout(() => every(60 * 60e3, () => refreshPerps(true)), 20000);
   every(15 * 60e3, refreshMacro);
-  setTimeout(() => every(5 * 60e3, refreshDesk), 30000);
   setTimeout(() => every(60 * 60e3, refreshTraders), 120000);
+  setTimeout(() => every(30 * 60e3, collectHip3Traders), 60000);
+  setTimeout(() => every(15 * 60e3, refreshScanner), 45000);
+  setTimeout(() => every(5 * 60e3, refreshWallets), 15000);
+  setTimeout(() => every(30 * 60e3, refreshResearch), 25000);
   openFollowStream();
   setInterval(netflowCheck, 10 * 60e3);
   setInterval(dailyDigest, 5 * 60e3);
@@ -1376,4 +2042,4 @@ function start() {
   if (CFG.telegramChat) tgSend("🐻 TraderGze Intel server started. /status for details.");
 }
 if (require.main === module) start();
-module.exports = { serve, addEvents, learnFromBtc, netflowCheck, db, CFG, onTelegram, cache, refreshDesk, refreshTraders, follow, kvGet };
+module.exports = { refreshScanner, refreshResearch, refreshWallets, setWallet, flowBars, research, serve, addEvents, learnFromBtc, netflowCheck, db, CFG, onTelegram, cache, refreshDesk, refreshTraders, follow, kvGet };
